@@ -43,6 +43,7 @@ class AtomicData(torch_geometric.data.Data):
     magmom: torch.Tensor
     magforces: torch.Tensor
     dipole: torch.Tensor
+    quadrupole: torch.Tensor
     charges: torch.Tensor
     polarizability: torch.Tensor
     total_charge: torch.Tensor
@@ -98,6 +99,7 @@ class AtomicData(torch_geometric.data.Data):
         volume: Optional[torch.Tensor] = None,  # [,]
         fermi_level: Optional[torch.Tensor] = None,  # [,]
         external_field: Optional[torch.Tensor] = None,  # [1,3]
+        quadrupole: Optional[torch.Tensor] = None,  # [1,3,3]
         **extra_data: torch.Tensor,
     ):
         # Check shapes
@@ -138,6 +140,7 @@ class AtomicData(torch_geometric.data.Data):
         assert volume is None or len(volume.shape) == 0
         assert fermi_level is None or len(fermi_level.shape) == 0
         assert external_field is None or external_field.shape == (1, 3)
+        assert quadrupole is None or quadrupole.shape == (1, 3, 3)
 
         # Aggregate data
         data = {
@@ -176,6 +179,7 @@ class AtomicData(torch_geometric.data.Data):
             "volume": volume,
             "fermi_level": fermi_level,
             "external_field": external_field,
+            "quadrupole": quadrupole,
         }
         data.update(extra_data)
         super().__init__(**data)
@@ -344,6 +348,13 @@ class AtomicData(torch_geometric.data.Data):
             if config.properties.get("dipole") is not None
             else torch.zeros(1, 3, dtype=torch.get_default_dtype())
         )
+        quadrupole = (
+            torch.tensor(
+                config.properties.get("quadrupole"), dtype=torch.get_default_dtype()
+            ).reshape(1, 3, 3)
+            if config.properties.get("quadrupole") is not None
+            else torch.zeros(1, 3, 3, dtype=torch.get_default_dtype())
+        )
         charges = (
             torch.tensor(
                 config.properties.get("charges"), dtype=torch.get_default_dtype()
@@ -460,6 +471,7 @@ class AtomicData(torch_geometric.data.Data):
             stress=stress,
             virials=virials,
             dipole=dipole,
+            quadrupole=quadrupole,
             charges=charges,
             magmom=magmom,
             magforces=magforces,

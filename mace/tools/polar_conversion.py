@@ -12,12 +12,20 @@ PBC_HANDLING_MODES = (
     "molecule_in_box",
     "mixed_periodic",
 )
+REALSPACE_METHODS = ("finite_difference", "analytical")
 
 
 def validate_pbc_handling(mode: str) -> None:
     if mode not in PBC_HANDLING_MODES:
         raise ValueError(
             f"Unsupported pbc_handling {mode!r}; choose {PBC_HANDLING_MODES}"
+        )
+
+
+def validate_realspace_method(method: str) -> None:
+    if method not in REALSPACE_METHODS:
+        raise ValueError(
+            f"Unsupported realspace_method {method!r}; choose {REALSPACE_METHODS}"
         )
 
 

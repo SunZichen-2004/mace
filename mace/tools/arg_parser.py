@@ -139,6 +139,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "MACE",
             "ScaleShiftMACE",
             "PolarMACE",
+            "Finetune_MACEPOLAR",
             "MACELES",
             "ScaleShiftBOTNet",
             "AtomicDipolesMACE",
@@ -378,6 +379,40 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="return electrostatic potentials from PolarMACE forward pass",
         type=str2bool,
         default=False,
+    )
+    parser.add_argument(
+        "--realspace_method",
+        help=(
+            "non-periodic electrostatics in PolarMACE. "
+            "finite_difference keeps the displaced-charge scheme used by "
+            "existing checkpoints; analytical uses closed-form Gaussian "
+            "multipole interactions (l <= 1)"
+        ),
+        type=str,
+        default="finite_difference",
+        choices=["finite_difference", "analytical"],
+    )
+    parser.add_argument(
+        "--compute_dipole_from_electric_field",
+        help="PolarMACE: also return dipole as dE/dF",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--compute_polarizability_from_electric_field",
+        help="PolarMACE: return polarizability as d2E/dF2 and add it to the quadrupole loss",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--pred_dipole_key",
+        help=(
+            "Which dipole enters the loss. dipole is the charge-density total_dipole; "
+            "field is dE/dF (total_dipole_from_electric_field); both adds the two terms."
+        ),
+        type=str,
+        default="dipole",
+        choices=["dipole", "field", "both"],
     )
     parser.add_argument(
         "--field_norm_factor",
@@ -692,6 +727,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=DefaultKeys.DIPOLE.value,
     )
     parser.add_argument(
+        "--quadrupole_key",
+        help="Key of reference quadrupoles in training xyz",
+        type=str,
+        default=DefaultKeys.QUADRUPOLE.value,
+    )
+    parser.add_argument(
         "--polarizability_key",
         help="Key of polarizability in training xyz",
         type=str,
@@ -785,6 +826,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "huber",
             "universal",
             "energy_forces_dipole",
+            "energy_forces_dipole_quadrupole",
             "l1l2energyforces",
         ],
     )
@@ -856,6 +898,20 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         dest="swa_dipole_weight",
+    )
+    parser.add_argument(
+        "--quadrupole_weight",
+        help="weight of quadrupole loss",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--swa_quadrupole_weight",
+        "--stage_two_quadrupole_weight",
+        help="weight of quadrupole loss after starting Stage Two",
+        type=float,
+        default=1.0,
+        dest="swa_quadrupole_weight",
     )
     parser.add_argument(
         "--swa_polarizability_weight",

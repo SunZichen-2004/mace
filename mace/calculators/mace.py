@@ -32,7 +32,10 @@ from mace.tools.compile import (
 )
 from mace.tools.default_keys import DefaultKeys
 from mace.tools.deprecation import warn
-from mace.tools.polar_conversion import validate_pbc_handling
+from mace.tools.polar_conversion import (
+    validate_pbc_handling,
+    validate_realspace_method,
+)
 from mace.tools.scripts_utils import extract_model
 
 try:
@@ -95,6 +98,9 @@ class MACECalculator(Calculator):
         pbc_handling: Polar electrostatic mode. "auto" delegates boundary-condition
             dispatch to the model and graph_longrange. Explicit modes
             are realspace, pbc, slab, molecule_in_box, and mixed_periodic.
+        realspace_method: optional Polar non-periodic evaluator. None leaves
+            the loaded model unchanged. "finite_difference" is the displaced-charge
+            scheme; "analytical" is the closed-form Gaussian multipole interaction.
         compute_stress: bool, whether to compute stress for energy models (default
             True). Set False for fixed-cell MD; stress is then unavailable through
             ASE and cannot be combined with compute_atomic_stresses=True.
@@ -126,6 +132,7 @@ class MACECalculator(Calculator):
         electric_field_unit: float = 1.0,
         keep_neutral: bool = True,
         pbc_handling: str = "auto",
+        realspace_method: Union[str, None] = None,
         compute_stress: bool = True,
         **kwargs,
     ):
@@ -397,6 +404,12 @@ class MACECalculator(Calculator):
 
         if self.model_type == "PolarMACE":
             self.set_electrostatic_pbcs(pbc_handling)
+            if realspace_method is not None:
+                self.set_realspace_method(realspace_method)
+            else:
+                self.realspace_method = getattr(
+                    self.models[0], "realspace_method", "finite_difference"
+                )
 
         self.use_compile = False
         if compile_mode is not None:
@@ -681,6 +694,18 @@ class MACECalculator(Calculator):
         for model in self.models:
             model.set_electrostatic_pbcs(pbc_handling)
         self.pbc_handling = pbc_handling
+        self.reset()
+
+    def set_realspace_method(self, realspace_method: str) -> None:
+        """Swap the non-periodic Polar evaluator and invalidate cached ASE results.
+
+        ``analytical`` changes predictions of models trained with the
+        displaced-charge finite-difference electrostatics.
+        """
+        validate_realspace_method(realspace_method)
+        for model in self.models:
+            model.set_realspace_method(realspace_method)
+        self.realspace_method = realspace_method
         self.reset()
 
     def _validate_electrostatic_pbcs(self, atoms) -> None:

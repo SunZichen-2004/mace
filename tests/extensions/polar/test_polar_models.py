@@ -215,7 +215,7 @@ def _build_full_model(
     return model
 
 
-def _build_minimal_model(device, dtype):
+def _build_minimal_model(device, dtype, realspace_method="finite_difference"):
     num_elements = 2
     atomic_numbers = [1, 8]
     hidden_irreps = o3.Irreps("4x0e + 4x1o")
@@ -269,6 +269,7 @@ def _build_minimal_model(device, dtype):
         field_norm_factor=1.0,
         fixedpoint_update_config=fixedpoint_update_config,
         field_readout_config=field_readout_config,
+        realspace_method=realspace_method,
     ).to(device=device, dtype=dtype)
     return model
 

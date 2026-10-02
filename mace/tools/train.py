@@ -65,9 +65,21 @@ def valid_err_log(
     if log_errors == "PerAtomRMSE":
         error_e = eval_metrics["rmse_e_per_atom"] * 1e3
         error_f = eval_metrics["rmse_f"] * 1e3
-        logging.info(
-            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
+        msg = (
+            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, "
+            f"RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
         )
+        if "rmse_mu" in eval_metrics:
+            msg += f", RMSE_mu={eval_metrics['rmse_mu']:.6f} e·Å"
+        if "rmse_mu_field" in eval_metrics:
+            msg += f", RMSE_mu_field={eval_metrics['rmse_mu_field']:.6f} e·Å"
+        if "rmse_polarizability" in eval_metrics:
+            msg += (
+                f", RMSE_alpha={eval_metrics['rmse_polarizability']:.6f} e·Å²/V"
+            )
+        if "rmse_quadrupole" in eval_metrics:
+            msg += f", RMSE_Q={eval_metrics['rmse_quadrupole']:.6f} e·Å² traceless"
+        logging.info(msg)
     elif (
         log_errors == "PerAtomRMSEstressvirials"
         and eval_metrics["rmse_stress"] is not None
@@ -418,6 +430,11 @@ def train_one_epoch(
                 logger.log(opt_metrics)
 
 
+def _mae_rmse(delta: torch.Tensor) -> Tuple[float, float]:
+    values = to_numpy(delta.detach().reshape(-1))
+    return compute_mae(values), compute_rmse(values)
+
+
 def take_step(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -432,6 +449,8 @@ def take_step(
     batch = batch.to(device)
     batch_dict = batch.to_dict()
 
+    captured = {}
+
     def closure():
         optimizer.zero_grad(set_to_none=True)
         kwargs = dict(
@@ -443,6 +462,7 @@ def take_step(
         if output_args.get("magforces", False):
             kwargs["compute_magforces"] = True
         output = model(batch_dict, **kwargs)
+        captured["output"] = output
         loss = loss_fn(pred=output, ref=batch)
         loss.backward()
         if max_grad_norm is not None:
@@ -460,6 +480,28 @@ def take_step(
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
     }
+    output = captured.get("output")
+    if output is not None:
+        num_atoms = batch.ptr[1:] - batch.ptr[:-1]
+        if output.get("energy") is not None and batch.energy is not None:
+            delta_e = (batch.energy - output["energy"]).detach()
+            loss_dict["mae_e"], loss_dict["rmse_e"] = _mae_rmse(delta_e)
+            loss_dict["mae_e_per_atom"], loss_dict["rmse_e_per_atom"] = _mae_rmse(
+                delta_e / num_atoms
+            )
+        if output.get("forces") is not None and batch.forces is not None:
+            loss_dict["mae_f"], loss_dict["rmse_f"] = _mae_rmse(
+                batch.forces - output["forces"]
+            )
+        if output.get("dipole") is not None and getattr(batch, "dipole", None) is not None:
+            loss_dict["mae_mu"], loss_dict["rmse_mu"] = _mae_rmse(
+                batch.dipole - output["dipole"]
+            )
+        field_mu = output.get("total_dipole_from_electric_field") if output else None
+        if field_mu is not None and getattr(batch, "dipole", None) is not None:
+            loss_dict["mae_mu_field"], loss_dict["rmse_mu_field"] = _mae_rmse(
+                batch.dipole - field_mu
+            )
 
     return loss, loss_dict
 
@@ -637,6 +679,12 @@ class MACELoss(Metric):
         self.add_state("delta_mus", default=[], dist_reduce_fx="cat")
         self.add_state("delta_mus_per_atom", default=[], dist_reduce_fx="cat")
         self.add_state(
+            "Mus_field_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
+        self.add_state("delta_mus_field", default=[], dist_reduce_fx="cat")
+        self.add_state("Qs_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("delta_qs", default=[], dist_reduce_fx="cat")
+        self.add_state(
             "polarizability_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
         )
         self.add_state("delta_polarizability", default=[], dist_reduce_fx="cat")
@@ -711,6 +759,37 @@ class MACELoss(Metric):
                 batch.weight,
                 batch.dipole_weight,
                 spread_quantity_vector=False,
+            )
+        field_mu = output.get("total_dipole_from_electric_field")
+        if field_mu is not None and batch.dipole is not None:
+            self.delta_mus_field.append(batch.dipole - field_mu)
+            self.Mus_field_computed += filter_nonzero_weight(
+                batch,
+                self.delta_mus_field,
+                batch.weight,
+                batch.dipole_weight,
+                spread_quantity_vector=False,
+            )
+        if (
+            output.get("quadrupole") is not None
+            and getattr(batch, "quadrupole", None) is not None
+        ):
+            from mace.modules.loss import _QUADRUPOLE_COMPONENTS
+            from mace.modules.utils import traceless_quadrupole
+
+            n_graphs = int(batch.ptr.numel() - 1)
+            pred_q = output["quadrupole"]
+            ref_q = traceless_quadrupole(batch.quadrupole.view(n_graphs, 3, 3))
+            delta_q = torch.stack(
+                [ref_q[:, i, j] - pred_q[:, i, j] for i, j in _QUADRUPOLE_COMPONENTS],
+                dim=-1,
+            )
+            self.delta_qs.append(delta_q)
+            self.Qs_computed += filter_nonzero_weight(
+                batch,
+                self.delta_qs,
+                batch.weight,
+                torch.ones_like(batch.weight),
             )
         if (
             output.get("polarizability") is not None
@@ -800,6 +879,15 @@ class MACELoss(Metric):
             aux["rmse_mu_per_atom"] = compute_rmse(delta_mus_per_atom)
             aux["rel_rmse_mu"] = compute_rel_rmse(delta_mus, mus)
             aux["q95_mu"] = compute_q95(delta_mus)
+        if self.Mus_field_computed:
+            delta_mus_field = self.convert(self.delta_mus_field)
+            aux["mae_mu_field"] = compute_mae(delta_mus_field)
+            aux["rmse_mu_field"] = compute_rmse(delta_mus_field)
+        if self.Qs_computed:
+            delta_qs = self.convert(self.delta_qs)
+            aux["mae_quadrupole"] = compute_mae(delta_qs)
+            aux["rmse_quadrupole"] = compute_rmse(delta_qs)
+            aux["q95_quadrupole"] = compute_q95(delta_qs)
         if self.polarizability_computed:
             delta_polarizability = self.convert(self.delta_polarizability)
             delta_polarizability_per_atom = self.convert(

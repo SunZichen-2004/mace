@@ -93,6 +93,43 @@ def test_legacy_conversion_preserves_tensors_and_rebinds_after_reload(tmp_path):
     assert restored.coulomb_energy.pbc_handling == "pbc"
 
 
+def test_realspace_method_selects_analytical_evaluator():
+    model = _build_minimal_model(
+        torch.device("cpu"), torch.float64, realspace_method="analytical"
+    )
+    assert model.realspace_method == "analytical"
+    assert type(model.coulomb_energy.realspace_energy).__name__ == (
+        "RealSpaceAnalyticalEnergy"
+    )
+    assert type(model.electric_potential_descriptor.realspace_features).__name__ == (
+        "RealSpaceAnalyticalElectrostaticFeatures"
+    )
+
+    model.set_realspace_method("finite_difference")
+    assert model.realspace_method == "finite_difference"
+    assert type(model.coulomb_energy.realspace_energy).__name__ == (
+        "RealSpaceFiniteDiffereneEnergy"
+    )
+    assert type(model.electric_potential_descriptor.realspace_features).__name__ == (
+        "RealSpaceFiniteDifferenceElectrostaticFeatures"
+    )
+
+    calc = MACECalculator(
+        models=[model],
+        model_type="PolarMACE",
+        device="cpu",
+        default_dtype="float64",
+    )
+    assert calc.realspace_method == "finite_difference"
+    calc.set_realspace_method("analytical")
+    assert calc.models[0].realspace_method == "analytical"
+    assert type(calc.models[0].coulomb_energy.realspace_energy).__name__ == (
+        "RealSpaceAnalyticalEnergy"
+    )
+    with pytest.raises(ValueError, match="Unsupported realspace_method"):
+        calc.set_realspace_method("displaced")
+
+
 def test_conversion_rejects_conflicting_schema(tmp_path):
     model = _build_minimal_model(torch.device("cpu"), torch.float32)
     model.coulomb_energy.realspace_energy.self_interaction.features_dim = -1

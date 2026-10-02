@@ -381,6 +381,15 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         config["field_norm_factor"] = model.field_norm_factor
         config["field_si"] = model.field_si
         config["pbc_handling"] = getattr(model, "pbc_handling", "auto")
+        config["realspace_method"] = getattr(
+            model, "realspace_method", "finite_difference"
+        )
+        config["compute_dipole_from_electric_field"] = getattr(
+            model, "compute_dipole_from_electric_field", False
+        )
+        config["compute_polarizability"] = getattr(
+            model, "compute_polarizability", False
+        )
         config["fixedpoint_update_config"] = getattr(
             model, "_fixedpoint_update_config"
         ).copy()
@@ -831,6 +840,22 @@ def get_loss_fn(
             energy_weight=args.energy_weight,
             forces_weight=args.forces_weight,
             dipole_weight=args.dipole_weight,
+            pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
+        )
+    elif args.loss == "energy_forces_dipole_quadrupole":
+        assert dipole_only is False and compute_dipole is True
+        polar_weight = (
+            args.polarizability_weight
+            if getattr(args, "compute_polarizability_from_electric_field", False)
+            else 0.0
+        )
+        loss_fn = modules.WeightedEnergyForcesDipoleQuadrupoleLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            dipole_weight=args.dipole_weight,
+            quadrupole_weight=args.quadrupole_weight,
+            polarizability_weight=polar_weight,
+            pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
         )
     else:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
@@ -887,9 +912,27 @@ def get_swa(
             args.swa_energy_weight,
             forces_weight=args.swa_forces_weight,
             dipole_weight=args.swa_dipole_weight,
+            pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
         )
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
+        )
+    elif args.loss == "energy_forces_dipole_quadrupole":
+        swa_polar_weight = (
+            args.swa_polarizability_weight
+            if getattr(args, "compute_polarizability_from_electric_field", False)
+            else 0.0
+        )
+        loss_fn_energy = modules.WeightedEnergyForcesDipoleQuadrupoleLoss(
+            energy_weight=args.swa_energy_weight,
+            forces_weight=args.swa_forces_weight,
+            dipole_weight=args.swa_dipole_weight,
+            quadrupole_weight=args.swa_quadrupole_weight,
+            polarizability_weight=swa_polar_weight,
+            pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
+        )
+        logging.info(
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight}, quadrupole weight : {args.swa_quadrupole_weight} and learning rate : {args.swa_lr}"
         )
     elif args.loss == "universal":
         loss_fn_energy = modules.UniversalLoss(
@@ -941,6 +984,17 @@ def get_params_options(
             no_decay_interactions[name] = param
 
     lr_params_factors = json.loads(args.lr_params_factors)
+
+    def _group_lr(key: str, fallback_key: Optional[str] = None) -> float:
+        if key in lr_params_factors:
+            factor = lr_params_factors[key]
+        elif fallback_key is not None and fallback_key in lr_params_factors:
+            factor = lr_params_factors[fallback_key]
+        elif "default_lr_factor" in lr_params_factors:
+            factor = lr_params_factors["default_lr_factor"]
+        else:
+            factor = 1.0
+        return float(factor) * args.lr
 
     if args.freeze:
         if args.freeze >= 7:
@@ -1022,11 +1076,47 @@ def get_params_options(
         submodule_parameters = list(submodule.parameters())
         if not submodule_parameters:
             continue
+        if submodule_name == "field_dependent_charges_maps":
+            tp_mix_parameters = []
+            other_parameters = []
+            for parameter_name, parameter in submodule.named_parameters():
+                if "tp_mix" in parameter_name.split("."):
+                    tp_mix_parameters.append(parameter)
+                else:
+                    other_parameters.append(parameter)
+            if other_parameters:
+                param_options["params"].append(
+                    {
+                        "name": submodule_name,
+                        "params": other_parameters,
+                        "weight_decay": 0.0,
+                        "lr": _group_lr(f"{submodule_name}_lr_factor"),
+                    }
+                )
+            if tp_mix_parameters:
+                param_options["params"].append(
+                    {
+                        "name": "tp_mix",
+                        "params": tp_mix_parameters,
+                        "weight_decay": 0.0,
+                        "lr": _group_lr(
+                            "tp_mix_lr_factor",
+                            fallback_key=f"{submodule_name}_lr_factor",
+                        ),
+                    }
+                )
+            elif "tp_mix_lr_factor" in lr_params_factors:
+                raise RuntimeError(
+                    "tp_mix_lr_factor was set but field_dependent_charges_maps "
+                    "has no tp_mix parameters"
+                )
+            continue
         param_options["params"].append(
             {
                 "name": submodule_name,
                 "params": submodule_parameters,
                 "weight_decay": 0.0,
+                "lr": _group_lr(f"{submodule_name}_lr_factor"),
             }
         )
 

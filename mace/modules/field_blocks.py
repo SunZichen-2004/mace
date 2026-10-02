@@ -278,6 +278,25 @@ class FieldUpdateBlock(torch.nn.Module):
         ...
 
 
+def uvu_instructions_into(
+    irreps_in1: o3.Irreps, irreps_in2: o3.Irreps, irreps_out: o3.Irreps
+):
+    """uvu paths whose outputs land in the simplified ``irreps_out`` slots."""
+    irreps_in1 = o3.Irreps(irreps_in1)
+    irreps_in2 = o3.Irreps(irreps_in2)
+    irreps_out = o3.Irreps(irreps_out)
+    out_index = {ir: k for k, (_, ir) in enumerate(irreps_out)}
+    instructions = []
+    for i, (_, ir1) in enumerate(irreps_in1):
+        for j, (_, ir2) in enumerate(irreps_in2):
+            for ir_out in ir1 * ir2:
+                k = out_index.get(ir_out)
+                if k is None:
+                    continue
+                instructions.append((i, j, k, "uvu", True))
+    return instructions
+
+
 def instructions_for_sparse_tp(feat_in1, feat_in2, feat_out):
     channels1 = feat_in1.count(o3.Irrep(0, 1))
     channels2 = feat_in2.count(o3.Irrep(0, 1))
@@ -298,7 +317,8 @@ class SparseUvuTensorProduct(torch.nn.Module):
     (`weight` + `output_mask`) for checkpoint/weight-transfer compatibility.
     Supported path types:
     - `l x l -> 0` (invariant contraction)
-    - `l x 0 -> l` (scalar modulation)
+    - `l x 0 -> l` (scalar modulation of the first input)
+    - `0 x l -> l` (scalar modulation of the second input)
     """
 
     def __init__(
@@ -372,14 +392,16 @@ class SparseUvuTensorProduct(torch.nn.Module):
                     "SparseUvuTensorProduct requires output multiplicity to match in1 multiplicity"
                 )
 
-            # Mode 0: l x l -> 0, Mode 1: l x 0 -> l
+            # Mode 0: l x l -> 0, Mode 1: l x 0 -> l, Mode 2: 0 x l -> l
             if d_out == 1 and d1 == d2:
                 mode_code = 0
             elif d2 == 1 and d_out == d1:
                 mode_code = 1
+            elif d1 == 1 and d_out == d2:
+                mode_code = 2
             else:
                 raise NotImplementedError(
-                    "SparseUvuTensorProduct only supports (l x l -> 0) and (l x 0 -> l) sparse paths"
+                    "SparseUvuTensorProduct only supports (l x l -> 0), (l x 0 -> l) and (0 x l -> l)"
                 )
 
             w_size = int(ins.path_shape[0] * ins.path_shape[1])
@@ -456,7 +478,7 @@ class SparseUvuTensorProduct(torch.nn.Module):
                 weighted_x2 = torch.einsum("uv,bvd->bud", w, x2v)
                 mixed = (x1v * weighted_x2).sum(dim=-1) / math.sqrt(float(d1))
                 out[:, out_start:out_stop] = out_block + path_weight * mixed
-            else:
+            elif mode_code == 1:
                 # (l x 0 -> l): x1 scaled per channel by weighted scalar mixture from x2.
                 x1v = to_mul_ir(in1_block, mul1, d1)
                 scalars = in2_block.view(batch, mul2)
@@ -466,6 +488,18 @@ class SparseUvuTensorProduct(torch.nn.Module):
                     x1v * mixed.unsqueeze(-1) / math.sqrt(float(d1))
                 )
                 out_block_mi = to_mul_ir(out_block, mul1, d1)
+                out[:, out_start:out_stop] = from_mul_ir(out_block_mi + contrib)
+            else:
+                # (0 x l -> l): output multiplicity follows the scalar input.
+                d2 = (in2_stop - in2_start) // mul2
+                scalars = in1_block.view(batch, mul1)
+                x2v = to_mul_ir(in2_block, mul2, d2)
+                w = self.weight[w_start:w_stop].view(mul1, mul2)
+                weighted_x2 = torch.einsum("uv,bvd->bud", w, x2v)
+                contrib = path_weight * (
+                    scalars.unsqueeze(-1) * weighted_x2 / math.sqrt(float(d2))
+                )
+                out_block_mi = to_mul_ir(out_block, mul1, d2)
                 out[:, out_start:out_stop] = from_mul_ir(out_block_mi + contrib)
 
         return out * self.output_mask
@@ -564,7 +598,18 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             target=layout_str,
             cueq_config=self.cueq_config,
         )
-
+        mix_instructions = uvu_instructions_into(
+            self.node_feats_irreps,
+            self.node_feats_irreps,
+            self.node_feats_irreps,
+        )
+        self.tp_mix = SparseUvuTensorProduct(
+            irreps_in1=self.node_feats_irreps,
+            irreps_in2=self.node_feats_irreps,
+            irreps_out=self.node_feats_irreps,
+            instructions=mix_instructions,
+            layout=layout_str,
+        )
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -583,12 +628,15 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             local_charges,
         )
         invariant_descriptors = self.dot_products(node_feats, mixed_feats)
+        # uvu: u = mixed_feats (field), v = node_feats. l x 0 -> l follows u.
+        equivariant_descriptors = self.tp_mix(mixed_feats, node_feats)
         source_embedding = self.source_embedding(node_attrs)
         invariant_descriptors_embedded = torch.cat(
             [invariant_descriptors, source_embedding], dim=-1
         )
         nonlin_feats = self.nonlinearity(invariant_descriptors_embedded)
         new_feats = self.tp_out(node_feats, nonlin_feats)
+        new_feats = new_feats + equivariant_descriptors
         readout_to_mul_ir = getattr(self, "_readout_to_mul_ir", None)
         readout_from_mul_ir = getattr(self, "_readout_from_mul_ir", None)
         if readout_to_mul_ir is not None:

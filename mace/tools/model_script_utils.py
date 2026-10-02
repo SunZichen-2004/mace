@@ -14,6 +14,75 @@ from mace.tools.torch_tools import dtype_dict
 from mace.tools.utils import AtomicNumberTable
 
 
+def _load_macepolar_finetune(model, foundation, keep_atomic_energies: bool = False) -> None:
+    """Copy a pretrained PolarMACE, then set the new tp_mix weights to zero.
+
+    The fresh model is constructed first, so e3nn initializes tp_mix at random.
+    strict=False keeps every overlapping pretrained parameter and leaves only
+    the new tensor-product weights unset. Those weights are zeroed after the
+    load; doing it earlier would be overwritten if the checkpoint contained them.
+
+    When E0s come from an explicit table (a json file or a literal dict), the
+    model is already built with that table. The foundation checkpoint stores a
+    different atomic_energies_fn, and copying it back would replace the table.
+    """
+    src = foundation.state_dict()
+    dst_shapes = {key: value.shape for key, value in model.state_dict().items()}
+    adapted = {}
+    kept_e0_keys = []
+    for key, value in src.items():
+        if keep_atomic_energies and "atomic_energies" in key:
+            kept_e0_keys.append(key)
+            continue
+        target_shape = dst_shapes.get(key)
+        if (
+            target_shape is not None
+            and value.shape != target_shape
+            and value.numel() == int(torch.tensor(target_shape).prod().item())
+        ):
+            logging.info(
+                "Reshaping %s from %s to %s to match the new model",
+                key,
+                tuple(value.shape),
+                tuple(target_shape),
+            )
+            value = value.reshape(target_shape)
+        adapted[key] = value
+    incompatible = model.load_state_dict(adapted, strict=False)
+    tp_missing = [key for key in incompatible.missing_keys if "tp_mix" in key]
+    other_missing = [key for key in incompatible.missing_keys if "tp_mix" not in key]
+    logging.info(
+        "Finetune_MACEPOLAR: loaded pretrained weights with strict=False; "
+        "new keys %s",
+        tp_missing,
+    )
+    if incompatible.unexpected_keys:
+        logging.warning(
+            "Pretrained checkpoint has keys absent from the new model: %s",
+            incompatible.unexpected_keys,
+        )
+    if kept_e0_keys:
+        logging.info(
+            "Keeping atomic energies from the provided E0s; "
+            "not overwritten by the foundation checkpoint: %s",
+            kept_e0_keys,
+        )
+    other_missing = [key for key in other_missing if key not in kept_e0_keys]
+    if other_missing:
+        logging.warning(
+            "Pretrained checkpoint is missing keys other than tp_mix: %s",
+            other_missing,
+        )
+    n_zeroed = 0
+    for name, param in model.named_parameters():
+        if name.endswith("tp_mix.weight"):
+            param.data.zero_()
+            n_zeroed += 1
+            logging.info("Set %s to 0 after load_state_dict", name)
+    if n_zeroed == 0:
+        raise RuntimeError("Finetune_MACEPOLAR found no tp_mix.weight parameters")
+
+
 def configure_model(
     args,
     train_loader,
@@ -91,10 +160,30 @@ def configure_model(
         "ScaleShiftMACE",
         "MACELES",
         "PolarMACE",
+        "Finetune_MACEPOLAR",
     ]:
         logging.info("Loading FOUNDATION model")
         model_config_foundation = extract_config_mace_model(model_foundation)
         model_config_foundation["atomic_energies"] = atomic_energies
+        if args.model in ("PolarMACE", "Finetune_MACEPOLAR"):
+            model_config_foundation["realspace_method"] = args.realspace_method
+            want_field_dipole = getattr(args, "pred_dipole_key", "dipole") in (
+                "field",
+                "both",
+            )
+            model_config_foundation["compute_dipole_from_electric_field"] = bool(
+                getattr(args, "compute_dipole_from_electric_field", False)
+            ) or want_field_dipole
+            model_config_foundation["compute_polarizability"] = bool(
+                getattr(args, "compute_polarizability_from_electric_field", False)
+            )
+            logging.info(
+                "Polar realspace_method=%s, dipole_from_field=%s, polarizability=%s, pred_dipole_key=%s",
+                args.realspace_method,
+                model_config_foundation["compute_dipole_from_electric_field"],
+                model_config_foundation["compute_polarizability"],
+                getattr(args, "pred_dipole_key", "dipole"),
+            )
 
         if args.embedding_specs:
             model_config_foundation["embedding_specs"] = args.embedding_specs
@@ -119,6 +208,7 @@ def configure_model(
         if args.model in (
             "ScaleShiftMACE",
             "PolarMACE",
+            "Finetune_MACEPOLAR",
             "MagneticScaleShiftMACE",
         ) or model_foundation.__class__.__name__ in (
             "ScaleShiftMACE",
@@ -212,7 +302,20 @@ def configure_model(
 
     model = _build_model(args, model_config, model_config_foundation, heads)
 
-    if model_foundation is not None:
+    if args.model == "Finetune_MACEPOLAR":
+        if model_foundation is None:
+            raise RuntimeError(
+                "--model Finetune_MACEPOLAR requires --foundation_model "
+                "(MACE-POLAR-1-M)"
+            )
+        e0s_text = "" if args.E0s is None else str(args.E0s).strip().lower()
+        keep_atomic_energies = e0s_text not in ("", "foundation", "estimated", "average")
+        _load_macepolar_finetune(
+            model,
+            model_foundation,
+            keep_atomic_energies=keep_atomic_energies,
+        )
+    elif model_foundation is not None:
         if getattr(args, "finetune_dipoles_polarizabilities", False):
             # MDP fine-tuning: dedicated loader that handles higher-order irreps
             load_foundations_mdp(model, model_foundation, z_table, max_L=args.max_L)
@@ -330,7 +433,10 @@ def _build_model(
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
         )
-    if args.model == "PolarMACE" and model_config_foundation is not None:
+    if (
+        args.model in ("PolarMACE", "Finetune_MACEPOLAR")
+        and model_config_foundation is not None
+    ):
         return modules.PolarMACE(**model_config_foundation)
     if args.model == "PolarMACE":
         field_feature_widths = _parse_literal_or_none(args.field_feature_widths)
@@ -371,6 +477,14 @@ def _build_model(
             field_norm_factor=args.field_norm_factor,
             fixedpoint_update_config=fixedpoint_update_config,
             field_readout_config=field_readout_config,
+            realspace_method=getattr(args, "realspace_method", "finite_difference"),
+            compute_dipole_from_electric_field=bool(
+                getattr(args, "compute_dipole_from_electric_field", False)
+            )
+            or getattr(args, "pred_dipole_key", "dipole") in ("field", "both"),
+            compute_polarizability=bool(
+                getattr(args, "compute_polarizability_from_electric_field", False)
+            ),
         )
     if args.model == "FoundationMACE":
         return modules.ScaleShiftMACE(**model_config_foundation)

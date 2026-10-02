@@ -701,6 +701,41 @@ def compute_total_charge_dipole_permuted(
     return total_charge, dipole
 
 
+def traceless_quadrupole(quad: torch.Tensor) -> torch.Tensor:
+    """Q -> Q - (tr Q / 3) I."""
+    trace = quad.diagonal(dim1=-1, dim2=-2).sum(dim=-1)
+    eye = torch.eye(3, device=quad.device, dtype=quad.dtype)
+    return quad - eye.view(1, 3, 3) * (trace / 3.0).view(-1, 1, 1)
+
+
+def compute_traceless_quadrupole_permuted(
+    density_coefficients: torch.Tensor,
+    positions: torch.Tensor,
+    batch: torch.Tensor,
+    num_graphs: int,
+) -> torch.Tensor:
+    """Traceless Cartesian second moment about the coordinate origin, e·Å².
+
+    Q_ab = sum_i (q_i R_ia R_ib + R_ia mu_ib + R_ib mu_ia), then Q - (tr Q / 3) I.
+    The Gaussian-width term q_i sigma^2 delta_ab is isotropic and drops out of the
+    traceless part. l=1 density coefficients are stored as (q, y, z, x).
+    """
+    charges = density_coefficients[:, 0]
+    if density_coefficients.shape[-1] >= 4:
+        atomic_dipole = density_coefficients[:, 1:4][:, [2, 0, 1]]
+    else:
+        atomic_dipole = density_coefficients.new_zeros(
+            density_coefficients.shape[0], 3
+        )
+    ra = positions.unsqueeze(-1)
+    rb = positions.unsqueeze(-2)
+    quad = charges[:, None, None] * ra * rb
+    quad = quad + ra * atomic_dipole.unsqueeze(-2) + rb * atomic_dipole.unsqueeze(-1)
+    out = density_coefficients.new_zeros(num_graphs, 3, 3)
+    out.index_add_(0, batch, quad)
+    return traceless_quadrupole(out)
+
+
 @torch.jit.ignore
 def compute_dielectric_gradients(
     dielectric: torch.Tensor,

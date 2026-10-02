@@ -34,6 +34,7 @@ from mace.modules.embeddings import GenericJointEmbedding
 from mace.modules.models import ScaleShiftMACE
 from mace.modules.utils import (
     compute_total_charge_dipole_permuted,
+    compute_traceless_quadrupole_permuted,
     get_atomic_virials_stresses,
     get_outputs,
     prepare_graph,
@@ -47,6 +48,7 @@ from mace.modules.wrapper_ops import (
 from mace.tools.polar_conversion import (
     ensure_polar_compatibility,
     validate_pbc_handling,
+    validate_realspace_method,
 )
 from mace.tools.scatter import scatter_mean, scatter_sum
 from mace.tools.torch_tools import spherical_to_cartesian
@@ -686,6 +688,9 @@ class PolarMACE(ScaleShiftMACE):
         fixedpoint_update_config: Optional[Dict[str, Any]] = None,
         field_readout_config: Optional[Dict[str, Any]] = None,
         pbc_handling: str = "auto",
+        realspace_method: str = "finite_difference",
+        compute_dipole_from_electric_field: bool = False,
+        compute_polarizability: bool = False,
         **kwargs,
     ):
         if not GRAPH_LONGRANGE_AVAILABLE:
@@ -693,6 +698,7 @@ class PolarMACE(ScaleShiftMACE):
                 "Cannot import 'graph_longrange'. Please install graph_electrostatics "
                 "from https://github.com/WillBaldwin0/graph_electrostatics."
             )
+        validate_realspace_method(realspace_method)
         try:
             hidden_irreps: o3.Irreps = kwargs["hidden_irreps"]
             MLP_irreps_raw = kwargs["MLP_irreps"]
@@ -751,6 +757,8 @@ class PolarMACE(ScaleShiftMACE):
         self.quadrupole_feature_corrections = quadrupole_feature_corrections
         self.field_si = field_si
         self.keep_last_layer_irreps = True
+        self.compute_dipole_from_electric_field = compute_dipole_from_electric_field
+        self.compute_polarizability = compute_polarizability
 
         # k-space cutoff heuristic
         kspace_cutoff = kspace_cutoff_factor * gto_basis_kspace_cutoff(
@@ -828,6 +836,7 @@ class PolarMACE(ScaleShiftMACE):
             quadrupole_feature_corrections=quadrupole_feature_corrections,
             integral_normalization="receiver",
             pbc_handling=pbc_handling,
+            realspace_method=realspace_method,
         )
         field_layout_target = (
             cueq_config.layout_str
@@ -947,8 +956,10 @@ class PolarMACE(ScaleShiftMACE):
             kspace_cutoff=float(kspace_cutoff),
             include_self_interaction=include_electrostatic_self_interaction,
             pbc_handling=pbc_handling,
+            realspace_method=realspace_method,
         )
         self.set_electrostatic_pbcs(pbc_handling)
+        self.realspace_method = realspace_method
         self.return_electrostatic_potentials = return_electrostatic_potentials
         self.layer_feature_mixer = MultiLayerFeatureMixer(
             node_feats_irreps=hidden_irreps,
@@ -972,6 +983,20 @@ class PolarMACE(ScaleShiftMACE):
         self.electric_potential_descriptor.set_pbc_handling(pbc_handling)
         self.coulomb_energy.set_pbc_handling(pbc_handling)
         self.pbc_handling = pbc_handling
+        self.electric_potential_descriptor.static_quantities = None
+
+    def set_realspace_method(self, realspace_method: str) -> None:
+        """Select the non-periodic multipole evaluator for features and energy.
+
+        ``finite_difference`` is the displaced-charge scheme existing Polar
+        weights were trained with. ``analytical`` is the closed-form Gaussian
+        multipole interaction (l <= 1) from graph_electrostatics. Swapping it
+        under a trained checkpoint changes predictions.
+        """
+        validate_realspace_method(realspace_method)
+        self.electric_potential_descriptor.set_realspace_method(realspace_method)
+        self.coulomb_energy.set_realspace_method(realspace_method)
+        self.realspace_method = realspace_method
         self.electric_potential_descriptor.static_quantities = None
 
     def forward(
@@ -1038,6 +1063,12 @@ class PolarMACE(ScaleShiftMACE):
             fermi_level = data["fermi_level"]
         if external_field is None:
             external_field = data["external_field"]
+        compute_dipole_from_electric_field = getattr(
+            self, "compute_dipole_from_electric_field", False
+        )
+        compute_polarizability = getattr(self, "compute_polarizability", False)
+        if compute_polarizability or compute_dipole_from_electric_field:
+            external_field = external_field.detach().requires_grad_(True)
         external_potential = torch.hstack(
             (torch.zeros_like(fermi_level).unsqueeze(-1), external_field)
         )
@@ -1338,7 +1369,54 @@ class PolarMACE(ScaleShiftMACE):
             + electro_energy
             + torch.sum(external_potential[:, 1:] * total_dipole, dim=-1)
         )
+        total_dipole_from_electric_field: Optional[torch.Tensor] = None
+        total_polarizability: Optional[torch.Tensor] = None
+        if compute_dipole_from_electric_field or compute_polarizability:
+            # μ = ∂E/∂F ; energy already includes +F·μ_charge
+            total_dipole_from_electric_field = torch.autograd.grad(
+                outputs=[total_energy],
+                inputs=[external_field],
+                grad_outputs=[torch.ones_like(total_energy)],
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if total_dipole_from_electric_field is None:
+                total_dipole_from_electric_field = torch.zeros_like(external_field)
+            if compute_polarizability:
+                # α_ij = ∂μ_i/∂F_j. One backward cannot fill a (B, 3, 3)
+                # Jacobian; is_grads_batched runs the 3 Cartesian rows together.
+                n_field, n_cart = external_field.shape
+                grad_outputs = (
+                    torch.eye(
+                        n_cart,
+                        device=external_field.device,
+                        dtype=external_field.dtype,
+                    )
+                    .unsqueeze(1)
+                    .expand(n_cart, n_field, n_cart)
+                )
+                total_polarizability = torch.autograd.grad(
+                    outputs=total_dipole_from_electric_field,
+                    inputs=external_field,
+                    grad_outputs=grad_outputs,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True,
+                    is_grads_batched=True,
+                )[0]
+                if total_polarizability is None:
+                    total_polarizability = external_field.new_zeros(
+                        (n_field, n_cart, n_cart)
+                    )
+                else:
+                    total_polarizability = total_polarizability.permute(1, 0, 2)
+            if not compute_dipole_from_electric_field:
+                total_dipole_from_electric_field = None
 
+        quadrupole = compute_traceless_quadrupole_permuted(
+            charge_density_mul_ir, long_range_positions, data["batch"], num_graphs
+        )
         forces, virials, stress, hessian, edge_forces, _ = get_outputs(
             energy=total_energy,
             positions=positions,
@@ -1393,6 +1471,10 @@ class PolarMACE(ScaleShiftMACE):
             "charges": charge_density_mul_ir[:, 0],
             "spins": spin_density_mul_ir[:, 0],
             "dipole": total_dipole,
+            "total_dipole_from_electric_field": total_dipole_from_electric_field,
+            "polarizability": total_polarizability,
+            "total_polarizability": total_polarizability,
+            "quadrupole": quadrupole,
             "total_charge": total_charge,
             "electrostatic_energy": electro_energy,
             "electron_energy": le_total,

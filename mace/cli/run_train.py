@@ -143,6 +143,21 @@ def run(args) -> None:
     args.foundation_model_kwargs = ast.literal_eval(args.foundation_model_kwargs)
     args.foundation_model_kwargs["head"] = args.foundation_head
 
+    if args.model == "Finetune_MACEPOLAR":
+        if args.foundation_model is None:
+            raise ValueError(
+                "--model Finetune_MACEPOLAR requires --foundation_model "
+                "pointing at MACE-POLAR-1-M"
+            )
+        args.multiheads_finetuning = False
+        args.foundation_model_elements = True
+        logging.info(
+            "Finetune_MACEPOLAR: loss=%s, lr=%s, keep foundation elements, "
+            "tp_mix.weight zeroed after load",
+            args.loss,
+            args.lr,
+        )
+
     # MDP fine-tuning validation
     if args.finetune_dipoles_polarizabilities:
         if args.model != "AtomicDielectricMACE":
@@ -507,7 +522,10 @@ def run(args) -> None:
         all_atomic_numbers.update(head_config.atomic_numbers)
     z_table = AtomicNumberTable(sorted(list(all_atomic_numbers)))
     if args.foundation_model_elements and model_foundation:
-        z_table = AtomicNumberTable(sorted(model_foundation.atomic_numbers.tolist()))
+        # Checkpoint order, not a resorted table: embedding rows are indexed by it.
+        z_table = AtomicNumberTable(
+            [int(z) for z in model_foundation.atomic_numbers.tolist()]
+        )
     logging.info(f"Atomic Numbers used: {z_table.zs}")
 
     # Atomic energies
@@ -626,6 +644,16 @@ def run(args) -> None:
             args.compute_stress = False
             args.compute_polarizability = False
         elif args.model == "PolarMACE" and args.loss == "energy_forces_dipole":
+            args.compute_dipole = True
+            args.compute_energy = True
+            args.compute_forces = True
+            args.compute_virials = False
+            args.compute_stress = False
+            args.compute_polarizability = False
+        elif (
+            args.model == "Finetune_MACEPOLAR"
+            or args.loss == "energy_forces_dipole_quadrupole"
+        ):
             args.compute_dipole = True
             args.compute_energy = True
             args.compute_forces = True
@@ -932,7 +960,12 @@ def run(args) -> None:
             logging.info(f"Param: {name}: {list(st.keys())}")
 
     for i, param_group in enumerate(optimizer.param_groups):
-        logging.info(f"Param group {i}: lr = {param_group['lr']}")
+        group_name = param_group.get("name", "")
+        n_params = sum(parameter.numel() for parameter in param_group["params"])
+        logging.info(
+            f"Param group {i} ({group_name}): lr = {param_group['lr']}, "
+            f"n_params = {n_params}"
+        )
 
     logger = tools.MetricsLogger(
         directory=args.results_dir, tag=tag + "_train"
