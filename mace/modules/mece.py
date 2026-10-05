@@ -190,7 +190,7 @@ class EdgeClusterExpansion(torch.nn.Module):
         self.num_orders = 2 * m_max + 1
         self.nu_max = nu_max
         self.env_radial_mlp = _mlp(
-            environment_basis_dim + 3 * element_embedding_dim,
+            environment_basis_dim + num_bessel + 3 * element_embedding_dim,
             64,
             num_density_channels * self.num_orders,
         )
@@ -215,7 +215,12 @@ class EdgeClusterExpansion(torch.nn.Module):
     def _environment_radial(self, geometry: Dict[str, torch.Tensor]) -> torch.Tensor:
         """g^{nm}=f_cut R_nm times the selected angular embedding; R is independent for each signed m."""
         features = torch.cat(
-            (geometry["env_features"], geometry["env_species"]), dim=-1
+            (
+                geometry["env_features"],
+                geometry["bond_rbf"][geometry["bond_index"]],
+                geometry["env_species"],
+            ),
+            dim=-1,
         )
         weights = self.env_radial_mlp(features).reshape(
             features.shape[0], self.num_density_channels, self.num_orders
@@ -397,9 +402,10 @@ class MECE(torch.nn.Module):
         midpoint = 0.5 * (endpoint_i + endpoint_j)
         frames = bond_frames(-vectors)
         element_features = self.element_embedding(node_attrs)
+        bond_rbf = self.cylindrical_basis.bessel(lengths)
         bond_features = torch.cat(
             (
-                self.cylindrical_basis.bessel(lengths),
+                bond_rbf,
                 element_features[receiver],
                 element_features[sender],
             ),
@@ -474,6 +480,7 @@ class MECE(torch.nn.Module):
             "receiver": receiver,
             "sender": sender,
             "bond_features": bond_features,
+            "bond_rbf": bond_rbf,
             "bond_cutoff": self.cutoff(lengths),
             "bond_index": bond_index,
             "bond_neighbor_atom_index": bond_neighbor_atom_index,

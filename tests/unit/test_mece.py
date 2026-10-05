@@ -86,6 +86,7 @@ def test_independent_signed_radial_weights_and_exact_neighbor_sum():
         )
     geometry = dict(
         env_features=torch.zeros(2, 7),
+        bond_rbf=torch.zeros(2, 3),
         env_species=torch.zeros(2, 9),
         env_cutoff=torch.tensor([[0.5], [0.25]]),
         env_phase=torch.ones(2, 5, dtype=torch.complex128),
@@ -97,6 +98,30 @@ def test_independent_signed_radial_weights_and_exact_neighbor_sum():
     narrow, _ = expansion(geometry)
     torch.testing.assert_close(narrow[0], g.sum(0))
     torch.testing.assert_close(narrow[1], torch.zeros_like(narrow[1]))
+
+
+def test_environment_density_depends_on_bond_length_and_backpropagates():
+    net = model()
+    lengths = torch.tensor([[0.7], [1.2]], requires_grad=True)
+    geometry = dict(
+        env_features=torch.zeros(2, 7),
+        bond_rbf=net.cylindrical_basis.bessel(lengths),
+        env_species=torch.zeros(2, 9),
+        env_cutoff=torch.ones(2, 1),
+        env_phase=torch.ones(2, 5, dtype=torch.complex128),
+        bond_index=torch.tensor([1, 0]),
+        number_of_edges=2,
+    )
+    expansion = net.edge_cluster_expansion
+    density = expansion._environment_radial(geometry)
+    assert not torch.allclose(density[0], density[1])
+    reordered = expansion._environment_radial(
+        dict(geometry, bond_index=torch.tensor([0, 1]))
+    )
+    torch.testing.assert_close(density, reordered.flip(0))
+    gradient = torch.autograd.grad(density.real.square().sum(), lengths)[0]
+    assert torch.isfinite(gradient).all()
+    assert torch.all(gradient.abs() > 1e-10)
 
 
 @pytest.mark.parametrize("union", [False, True])
