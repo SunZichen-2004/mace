@@ -241,13 +241,18 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
             "num_bessel": int(model.num_bessel),
             "num_polynomial_cutoff": int(model.num_polynomial_cutoff),
             "max_ell": int(model.l_max),
-            "q_max": int(model.q_max),
             "num_interactions": int(model.num_interactions),
             "hidden_irreps": str(model.hidden_irreps),
             "correlation": int(model.nu_max),
             "avg_num_neighbors": float(model.avg_num_neighbors),
             "atomic_numbers": model.atomic_numbers.detach().cpu().tolist(),
             "heads": list(model.heads),
+            "num_density_channels": model.num_density_channels,
+            "element_embedding_dim": model.element_embedding_dim,
+            "z_basis": model.z_basis,
+            "smooth_theta_embedding": model.smooth_theta_embedding,
+            "bond_neighbor_union": model.bond_neighbor_union,
+            "bond_neighbor_middle": model.bond_neighbor_middle,
         }
     if type(model).__name__ == "ECENet":
         return {
@@ -974,12 +979,12 @@ def freeze_module(module: torch.nn.Module, freeze: bool = True):
 def get_params_options(
     args: argparse.Namespace, model: torch.nn.Module
 ) -> Dict[str, Any]:
-    if type(model).__name__ == "ECENet":
-        # No MACE interaction/readout split: one AdamW group over the core.
+    if type(model).__name__ in ("ECENet", "MECE"):
+        # Edge models have no atomic interaction/readout split.
         return dict(
             params=[
                 {
-                    "name": "ecenet",
+                    "name": type(model).__name__.lower(),
                     "params": [p for p in model.parameters() if p.requires_grad],
                     "weight_decay": args.weight_decay,
                     "lr": args.lr,

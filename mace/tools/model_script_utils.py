@@ -155,43 +155,16 @@ def configure_model(
         )
     else:
         logging.info("Building model")
-        logging.info(
-            f"Message passing with {args.num_channels} channels and max_L={args.max_L} ({args.hidden_irreps})"
-        )
+        if args.model != "MECE":
+            logging.info(
+                f"Message passing with {args.num_channels} channels and max_L={args.max_L} ({args.hidden_irreps})"
+            )
         if args.model == "MECE":
-            density_channels = getattr(args, "num_density_channels", None)
-            if density_channels is None:
-                density_channels = args.num_channels
             logging.info(
-                f"MECE bond-density width C_phi={density_channels} (node width C={args.num_channels})"
+                "MECE pure Edge Cluster Expansion: no message passing; "
+                f"C_phi={getattr(args, 'num_density_channels', None) or args.num_channels}, "
+                f"signed angular orders -{args.max_ell}..{args.max_ell}"
             )
-            logging.info(
-                "MECE self tensor product: "
-                + (
-                    "full C x C then project"
-                    if getattr(args, "full_self_tensor_product", False)
-                    else "channelwise"
-                )
-            )
-            logging.info(
-                "MECE nonlinear_B: "
-                + ("on" if getattr(args, "nonlinear_B", False) else "off")
-            )
-            logging.info(
-                "MECE mix_l_after_rotation: "
-                + (
-                    "fixed-m same-parity"
-                    if getattr(args, "mix_l_after_rotation", False)
-                    else "off"
-                )
-            )
-            if getattr(args, "so2_full_tp", False):
-                phi_tp = "SO2fulltp"
-            elif getattr(args, "so2_lowrank_tp", False):
-                phi_tp = f"SO2lowranktp(rank={getattr(args, 'so2_tp_rank', 8)})"
-            else:
-                phi_tp = "channelwise"
-            logging.info(f"MECE phi SO(2) product: {phi_tp}")
         if args.model == "ECENet":
             r_nb = getattr(args, "ecenet_r_cut_neighbor", None)
             if r_nb is None:
@@ -209,15 +182,23 @@ def configure_model(
                 f"self_tp_nu_max={nu} "
                 f"so2_linear={getattr(args, 'ecenet_so2_linear', False)}"
             )
-        logging.info(
-            f"{args.num_interactions} layers, each with correlation order: {args.correlation} (body order: {args.correlation+1}) and spherical harmonics up to: l={args.max_ell}"
-        )
+        if args.model == "MECE":
+            logging.info(
+                f"Single edge cluster expansion, correlation={args.correlation}; num_interactions is unused"
+            )
+        else:
+            logging.info(
+                f"{args.num_interactions} layers, each with correlation order: {args.correlation} (body order: {args.correlation+1}) and spherical harmonics up to: l={args.max_ell}"
+            )
         logging.info(
             f"{args.num_radial_basis} radial and {args.num_cutoff_basis} basis functions"
         )
-        logging.info(
-            f"Radial cutoff: {args.r_max} A (total receptive field for each atom: {args.r_max * args.num_interactions} A)"
-        )
+        if args.model == "MECE":
+            logging.info(f"Edge and bond-environment cutoff: {args.r_max} A")
+        else:
+            logging.info(
+                f"Radial cutoff: {args.r_max} A (total receptive field for each atom: {args.r_max * args.num_interactions} A)"
+            )
         logging.info(
             f"Distance transform for radial basis functions: {args.distance_transform}"
         )
@@ -329,14 +310,15 @@ def _build_model(
             atomic_inter_scale=args.std,
             atomic_inter_shift=_determine_atomic_inter_shift(args.mean, heads),
             num_density_channels=density_channels,
-            full_self_tensor_product=bool(
-                getattr(args, "full_self_tensor_product", False)
+            element_embedding_dim=getattr(args, "element_embedding_dim", None),
+            z_basis=getattr(args, "z_basis", "bessel"),
+            smooth_theta_embedding=bool(getattr(args, "smooth_theta_embedding", False)),
+            bond_neighbor_union=bool(getattr(args, "bond_neighbor_union", False)),
+            bond_neighbor_middle=(
+                not bool(getattr(args, "bond_neighbor_union", False))
+                if getattr(args, "bond_neighbor_middle", None) is None
+                else bool(args.bond_neighbor_middle)
             ),
-            nonlinear_B=bool(getattr(args, "nonlinear_B", False)),
-            mix_l_after_rotation=bool(getattr(args, "mix_l_after_rotation", False)),
-            so2_full_tp=bool(getattr(args, "so2_full_tp", False)),
-            so2_lowrank_tp=bool(getattr(args, "so2_lowrank_tp", False)),
-            so2_tp_rank=int(getattr(args, "so2_tp_rank", 8)),
         )
     if args.model == "ECENet":
         correlation = int(

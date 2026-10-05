@@ -16,15 +16,6 @@ import numpy as np
 import torch
 from e3nn import o3
 
-# Prefer an already-installed ``ecenet``; otherwise use the working copy.
-try:
-    from ecenet.model import ECENet as ECENetCore
-except ImportError:  # pragma: no cover
-    _ECENET_ROOT = Path("/u/sunzc/work/ecenet")
-    if _ECENET_ROOT.is_dir() and str(_ECENET_ROOT) not in sys.path:
-        sys.path.insert(0, str(_ECENET_ROOT))
-    from ecenet.model import ECENet as ECENetCore
-
 from mace.modules.blocks import AtomicEnergiesBlock, ScaleShiftBlock
 from mace.modules.utils import get_outputs, prepare_graph
 from mace.tools.scatter import scatter_sum
@@ -125,6 +116,24 @@ class ECENet(torch.nn.Module):
         self.scale_shift = ScaleShiftBlock(
             scale=atomic_inter_scale, shift=atomic_inter_shift
         )
+
+        # ECENet is optional; importing other MACE models must not require it.
+        try:
+            from ecenet.model import ECENet as ECENetCore
+        except ModuleNotFoundError as exc:
+            if exc.name not in ("ecenet", "ecenet.model"):
+                raise
+            ecenet_root = Path("/u/sunzc/work/ecenet")
+            if ecenet_root.is_dir() and str(ecenet_root) not in sys.path:
+                sys.path.insert(0, str(ecenet_root))
+            try:
+                from ecenet.model import ECENet as ECENetCore
+            except ModuleNotFoundError as missing:
+                if missing.name not in ("ecenet", "ecenet.model"):
+                    raise
+                raise ModuleNotFoundError(
+                    "The ECENet model requires the optional ecenet package"
+                ) from missing
 
         self.core = ECENetCore(
             n_types=num_elements,

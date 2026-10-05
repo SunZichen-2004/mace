@@ -298,47 +298,39 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--num_density_channels",
-        help="MECE bond-density / triplet channel width C_phi; defaults to num_channels",
+        help="MECE narrow bond-feature width C_phi; defaults to num_channels",
         type=int,
         default=None,
     )
     parser.add_argument(
-        "--full_self_tensor_product",
-        help="MECE: use full C x C self TP for B=A⊗A instead of channelwise products",
+        "--bond_neighbor_union",
         type=str2bool,
         default=False,
+        help="MECE: union of endpoint neighbors; cutoff is f_cut(min(r_ik,r_jk))",
     )
     parser.add_argument(
-        "--nonlinear_B",
-        help="MECE: SO(2) gated nonlinearity on each B^(nu), mixing channels; gates from q=0 MLP",
+        "--bond_neighbor_middle",
         type=str2bool,
-        default=False,
+        default=None,
+        help="MECE: midpoint neighbors and cutoff; default is the opposite of bond_neighbor_union",
     )
     parser.add_argument(
-        "--mix_l_after_rotation",
-        help="MECE: after the bond-frame rotation, mix ell>=|m| of equal parity with one real U per |m|",
-        type=str2bool,
-        default=False,
-    )
-    parser.add_argument(
-        "--SO2fulltp",
-        help="MECE: full C_phi x C_phi SO(2) bilinear map for phi_{aq}=W(x,g)",
-        dest="so2_full_tp",
-        type=str2bool,
-        default=False,
-    )
-    parser.add_argument(
-        "--SO2lowranktp",
-        help="MECE: low-rank SO(2) bilinear map for phi_{aq} with rank so2_tp_rank",
-        dest="so2_lowrank_tp",
-        type=str2bool,
-        default=False,
-    )
-    parser.add_argument(
-        "--so2_tp_rank",
-        help="MECE: rank R for SO2lowranktp (ignored unless SO2lowranktp is on)",
+        "--element_embedding_dim",
         type=int,
-        default=8,
+        default=None,
+        help="MECE: learned element embedding width; defaults to num_channels",
+    )
+    parser.add_argument(
+        "--z_basis",
+        choices=("bessel", "legendre"),
+        default="bessel",
+        help="MECE longitudinal encoding: Bessel plus z/r_max, or signed Legendre polynomials",
+    )
+    parser.add_argument(
+        "--smooth_theta_embedding",
+        type=str2bool,
+        default=False,
+        help="MECE: multiply each angular mode by (rho/r_max)^|m| using smooth Cartesian polynomials",
     )
     parser.add_argument(
         "--ecenet_n_layers",
