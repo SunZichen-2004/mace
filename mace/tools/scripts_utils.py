@@ -162,6 +162,7 @@ def get_dataset_from_xyz(
 
     test_configs_by_type = []
     if test_paths:
+        per_file = []
         for i, path in enumerate(test_paths):
             _, test_configs = data.load_from_xyz(
                 file_path=path,
@@ -171,11 +172,16 @@ def get_dataset_from_xyz(
                 head_name=head_name,
             )
             all_test_configs.extend(test_configs)
+            per_file.append((Path(path).stem, test_configs))
 
             log_dataset_contents(test_configs, f"Test set {i+1}/{len(test_paths)}")
 
-        # Create list of tuples (config_type, list(Atoms))
-        test_configs_by_type = data.test_config_types(all_test_configs)
+        # Several files that share config_type=Default would otherwise be merged.
+        # Keep one subset per file so 600K and 1200K stay separate.
+        if len(test_paths) > 1:
+            test_configs_by_type = per_file
+        else:
+            test_configs_by_type = data.test_config_types(all_test_configs)
         log_dataset_contents(all_test_configs, "Total Test set")
 
     atomic_energies_dict = {}
@@ -228,6 +234,42 @@ def print_git_commit():
 
 
 def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
+    if type(model).__name__ == "MECE":
+        return {
+            "model": "MECE",
+            "r_max": float(model.r_max),
+            "num_bessel": int(model.num_bessel),
+            "num_polynomial_cutoff": int(model.num_polynomial_cutoff),
+            "max_ell": int(model.l_max),
+            "q_max": int(model.q_max),
+            "num_interactions": int(model.num_interactions),
+            "hidden_irreps": str(model.hidden_irreps),
+            "correlation": int(model.nu_max),
+            "avg_num_neighbors": float(model.avg_num_neighbors),
+            "atomic_numbers": model.atomic_numbers.detach().cpu().tolist(),
+            "heads": list(model.heads),
+        }
+    if type(model).__name__ == "ECENet":
+        return {
+            "model": "ECENet",
+            "r_max": float(model.r_max),
+            "max_ell": int(model.l_max),
+            "num_interactions": int(model.num_interactions),
+            "hidden_irreps": str(model.hidden_irreps),
+            "correlation": int(model.self_tp_nu_max),
+            "avg_num_neighbors": float(model.avg_num_neighbors),
+            "atomic_numbers": model.atomic_numbers.detach().cpu().tolist(),
+            "heads": list(model.heads),
+            "embed_dim": int(model.embed_dim),
+            "n_layers": int(model.n_layers),
+            "n_mp": int(model.n_mp),
+            "n_max": int(model.n_max),
+            "r_cut_neighbor": float(model.r_cut_neighbor),
+            "self_tp": bool(model.self_tp),
+            "self_tp_full": bool(model.self_tp_full),
+            "self_tp_nu_max": int(model.self_tp_nu_max),
+            "so2_linear": bool(getattr(model, "so2_linear", False)),
+        }
     if model.__class__.__name__ not in [
         "ScaleShiftMACE",
         "MACELES",
@@ -932,6 +974,21 @@ def freeze_module(module: torch.nn.Module, freeze: bool = True):
 def get_params_options(
     args: argparse.Namespace, model: torch.nn.Module
 ) -> Dict[str, Any]:
+    if type(model).__name__ == "ECENet":
+        # No MACE interaction/readout split: one AdamW group over the core.
+        return dict(
+            params=[
+                {
+                    "name": "ecenet",
+                    "params": [p for p in model.parameters() if p.requires_grad],
+                    "weight_decay": args.weight_decay,
+                    "lr": args.lr,
+                }
+            ],
+            lr=args.lr,
+            amsgrad=args.amsgrad,
+            betas=(args.beta, 0.999),
+        )
     decay_interactions = {}
     no_decay_interactions = {}
     for name, param in model.interactions.named_parameters():
@@ -980,12 +1037,18 @@ def get_params_options(
                 "weight_decay": 0.0,
                 "lr": lr_params_factors.get("interactions_lr_factor", 1.0) * args.lr,
             },
-            {
-                "name": "products",
-                "params": model.products.parameters(),
-                "weight_decay": args.weight_decay,
-                "lr": lr_params_factors.get("products_lr_factor", 1.0) * args.lr,
-            },
+            *(
+                [
+                    {
+                        "name": "products",
+                        "params": product_parameters,
+                        "weight_decay": args.weight_decay,
+                        "lr": lr_params_factors.get("products_lr_factor", 1.0) * args.lr,
+                    }
+                ]
+                if (product_parameters := list(model.products.parameters()))
+                else []
+            ),
             {
                 "name": "readouts",
                 "params": model.readouts.parameters(),
@@ -1164,6 +1227,18 @@ class LRScheduler:
                 factor=args.lr_factor,
                 patience=args.scheduler_patience,
             )
+        elif args.scheduler == "CosineAnnealingLR":
+            eta_min = float(getattr(args, "lr_scheduler_eta_min", 1e-6))
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=optimizer,
+                T_max=int(args.max_num_epochs),
+                eta_min=eta_min,
+            )
+            logging.info(
+                "CosineAnnealingLR: T_max=%s, eta_min=%s",
+                args.max_num_epochs,
+                eta_min,
+            )
         else:
             raise RuntimeError(f"Unknown scheduler: '{args.scheduler}'")
 
@@ -1175,6 +1250,11 @@ class LRScheduler:
         elif self.scheduler == "ReduceLROnPlateau":
             self.lr_scheduler.step(  # pylint: disable=E1123
                 metrics=metrics, epoch=epoch
+            )
+        elif self.scheduler == "CosineAnnealingLR":
+            self.lr_scheduler.step()
+            logging.info(
+                "CosineAnnealingLR: lr = %.6e", self.lr_scheduler.get_last_lr()[0]
             )
 
     def __getattr__(self, name):

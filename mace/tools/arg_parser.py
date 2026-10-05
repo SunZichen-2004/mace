@@ -145,6 +145,8 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "AtomicDielectricMACE",
             "EnergyDipolesMACE",
             "MagneticScaleShiftMACE",
+            "MECE",
+            "ECENet",
         ],
     )
     parser.add_argument(
@@ -293,6 +295,98 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="number of embedding channels",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        "--num_density_channels",
+        help="MECE bond-density / triplet channel width C_phi; defaults to num_channels",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--full_self_tensor_product",
+        help="MECE: use full C x C self TP for B=A⊗A instead of channelwise products",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--nonlinear_B",
+        help="MECE: SO(2) gated nonlinearity on each B^(nu), mixing channels; gates from q=0 MLP",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--mix_l_after_rotation",
+        help="MECE: after the bond-frame rotation, mix ell>=|m| of equal parity with one real U per |m|",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--SO2fulltp",
+        help="MECE: full C_phi x C_phi SO(2) bilinear map for phi_{aq}=W(x,g)",
+        dest="so2_full_tp",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--SO2lowranktp",
+        help="MECE: low-rank SO(2) bilinear map for phi_{aq} with rank so2_tp_rank",
+        dest="so2_lowrank_tp",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--so2_tp_rank",
+        help="MECE: rank R for SO2lowranktp (ignored unless SO2lowranktp is on)",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--ecenet_n_layers",
+        help="ECENet: number of SO(2) equivariant layers (0 = noso2)",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--ecenet_n_mp",
+        help="ECENet: number of message-passing stages (n_mp=2 => one MP block)",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--ecenet_n_max",
+        help="ECENet: radial ACE n_max",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--ecenet_r_cut_neighbor",
+        help="ECENet: ACE neighbour cutoff (must be <= r_max); default min(r_max, 4.0)",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--ecenet_self_tp",
+        help="ECENet: enable SO(2) self tensor product before the layer stack",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--ecenet_self_tp_full",
+        help="ECENet: full (not channelwise) self tensor product",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--ecenet_self_tp_nu_max",
+        help="ECENet: self-TP correlation order; default = --correlation",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--ecenet_so2_linear",
+        help="ECENet: ablation, SO(2) channel mix of A only; skip the A⊗A product",
+        type=str2bool,
+        default=False,
     )
     parser.add_argument(
         "--max_L",
@@ -951,7 +1045,10 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument(
-        "--scheduler", help="Type of scheduler", type=str, default="ReduceLROnPlateau"
+        "--scheduler",
+        help="Type of scheduler: ReduceLROnPlateau, ExponentialLR, or CosineAnnealingLR",
+        type=str,
+        default="ReduceLROnPlateau",
     )
     parser.add_argument(
         "--lr_factor", help="Learning rate factor", type=float, default=0.8
@@ -964,6 +1061,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Gamma of learning rate scheduler",
         type=float,
         default=0.9993,
+    )
+    parser.add_argument(
+        "--lr_scheduler_eta_min",
+        help="Minimum learning rate for CosineAnnealingLR",
+        type=float,
+        default=1e-6,
     )
     parser.add_argument(
         "--swa",
@@ -1062,6 +1165,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--eval_interval", help="evaluate model every <n> epochs", type=int, default=1
+    )
+    parser.add_argument(
+        "--test_eval_interval",
+        help="evaluate test sets every <n> epochs; 0 disables periodic test evaluation",
+        type=int,
+        default=0,
     )
     parser.add_argument(
         "--keep_checkpoints",

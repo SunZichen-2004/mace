@@ -99,6 +99,40 @@ def _warn_about_v1_removals(parser, args) -> None:
             deprecation.warn_choice("reg", getattr(args, dest, None))
 
 
+def _build_ase_test_loaders(head_configs, args, z_table, heads):
+    """Build one loader per test file. Used for periodic test evaluation."""
+    test_sets = {}
+    selected = head_configs
+    if (
+        head_configs
+        and all(head.test_file == head_configs[0].test_file for head in head_configs)
+        and head_configs[0].test_file is not None
+    ):
+        selected = head_configs[:1]
+    for head_config in selected:
+        collections = getattr(head_config, "collections", None)
+        if collections is None:
+            continue
+        for name, subset in collections.tests:
+            test_sets[head_config.head_name + "_" + name] = [
+                data.AtomicData.from_config(
+                    config, z_table=z_table, cutoff=args.r_max, heads=heads
+                )
+                for config in subset
+            ]
+    loaders = {}
+    for test_name, test_set in test_sets.items():
+        loaders[test_name] = torch_geometric.dataloader.DataLoader(
+            test_set,
+            batch_size=args.valid_batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+        )
+    return loaders
+
+
 def run(args) -> None:
     """
     This script runs the training/fine tuning for mace
@@ -1039,6 +1073,17 @@ def run(args) -> None:
         logging.info("DRY RUN mode enabled. Stopping now.")
         return
 
+    test_data_loader = {}
+    if args.test_eval_interval > 0:
+        logging.info(
+            f"Evaluating test sets every {args.test_eval_interval} epochs"
+        )
+        test_data_loader = _build_ase_test_loaders(head_configs, args, z_table, heads)
+        logging.info(
+            "Periodic test loaders: "
+            + ", ".join(f"{name} ({len(loader.dataset)})" for name, loader in test_data_loader.items())
+        )
+
     tools.train(
         model=model,
         loss_fn=loss_fn,
@@ -1067,6 +1112,8 @@ def run(args) -> None:
         rank=rank,
         data_aug_magmom=args.data_aug_magmom,
         data_aug_magmom_mode=getattr(args, "data_aug_magmom_mode", "non-soc"),
+        test_loaders=test_data_loader or None,
+        test_eval_interval=args.test_eval_interval,
     )
 
     logging.info("")

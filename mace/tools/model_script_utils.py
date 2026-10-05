@@ -158,6 +158,57 @@ def configure_model(
         logging.info(
             f"Message passing with {args.num_channels} channels and max_L={args.max_L} ({args.hidden_irreps})"
         )
+        if args.model == "MECE":
+            density_channels = getattr(args, "num_density_channels", None)
+            if density_channels is None:
+                density_channels = args.num_channels
+            logging.info(
+                f"MECE bond-density width C_phi={density_channels} (node width C={args.num_channels})"
+            )
+            logging.info(
+                "MECE self tensor product: "
+                + (
+                    "full C x C then project"
+                    if getattr(args, "full_self_tensor_product", False)
+                    else "channelwise"
+                )
+            )
+            logging.info(
+                "MECE nonlinear_B: "
+                + ("on" if getattr(args, "nonlinear_B", False) else "off")
+            )
+            logging.info(
+                "MECE mix_l_after_rotation: "
+                + (
+                    "fixed-m same-parity"
+                    if getattr(args, "mix_l_after_rotation", False)
+                    else "off"
+                )
+            )
+            if getattr(args, "so2_full_tp", False):
+                phi_tp = "SO2fulltp"
+            elif getattr(args, "so2_lowrank_tp", False):
+                phi_tp = f"SO2lowranktp(rank={getattr(args, 'so2_tp_rank', 8)})"
+            else:
+                phi_tp = "channelwise"
+            logging.info(f"MECE phi SO(2) product: {phi_tp}")
+        if args.model == "ECENet":
+            r_nb = getattr(args, "ecenet_r_cut_neighbor", None)
+            if r_nb is None:
+                r_nb = min(float(args.r_max), 4.0)
+            nu = getattr(args, "ecenet_self_tp_nu_max", None)
+            if nu is None:
+                nu = args.correlation[0] if isinstance(args.correlation, list) else args.correlation
+            logging.info(
+                "ECENet: "
+                f"embed_dim={args.num_channels} l_max={args.max_ell} n_max={getattr(args, 'ecenet_n_max', 4)} "
+                f"n_layers={getattr(args, 'ecenet_n_layers', 2)} n_mp={getattr(args, 'ecenet_n_mp', 1)} "
+                f"r_cut_edge={args.r_max} r_cut_neighbor={r_nb} "
+                f"self_tp={getattr(args, 'ecenet_self_tp', False)} "
+                f"self_tp_full={getattr(args, 'ecenet_self_tp_full', False)} "
+                f"self_tp_nu_max={nu} "
+                f"so2_linear={getattr(args, 'ecenet_so2_linear', False)}"
+            )
         logging.info(
             f"{args.num_interactions} layers, each with correlation order: {args.correlation} (body order: {args.correlation+1}) and spherical harmonics up to: l={args.max_ell}"
         )
@@ -260,6 +311,62 @@ def _build_model(
     args, model_config, model_config_foundation, heads
 ):  # pylint: disable=too-many-return-statements
 
+    if args.model == "MECE":
+        density_channels = getattr(args, "num_density_channels", None)
+        return modules.MECE(
+            r_max=model_config["r_max"],
+            num_bessel=model_config["num_bessel"],
+            num_polynomial_cutoff=model_config["num_polynomial_cutoff"],
+            max_ell=model_config["max_ell"],
+            num_interactions=model_config["num_interactions"],
+            num_elements=model_config["num_elements"],
+            hidden_irreps=model_config["hidden_irreps"],
+            atomic_energies=model_config["atomic_energies"],
+            avg_num_neighbors=model_config["avg_num_neighbors"],
+            atomic_numbers=list(model_config["atomic_numbers"]),
+            correlation=int(args.correlation[0] if isinstance(args.correlation, list) else args.correlation),
+            heads=heads,
+            atomic_inter_scale=args.std,
+            atomic_inter_shift=_determine_atomic_inter_shift(args.mean, heads),
+            num_density_channels=density_channels,
+            full_self_tensor_product=bool(
+                getattr(args, "full_self_tensor_product", False)
+            ),
+            nonlinear_B=bool(getattr(args, "nonlinear_B", False)),
+            mix_l_after_rotation=bool(getattr(args, "mix_l_after_rotation", False)),
+            so2_full_tp=bool(getattr(args, "so2_full_tp", False)),
+            so2_lowrank_tp=bool(getattr(args, "so2_lowrank_tp", False)),
+            so2_tp_rank=int(getattr(args, "so2_tp_rank", 8)),
+        )
+    if args.model == "ECENet":
+        correlation = int(
+            args.correlation[0] if isinstance(args.correlation, list) else args.correlation
+        )
+        return modules.ECENet(
+            r_max=model_config["r_max"],
+            num_bessel=model_config["num_bessel"],
+            num_polynomial_cutoff=model_config["num_polynomial_cutoff"],
+            max_ell=model_config["max_ell"],
+            num_interactions=model_config["num_interactions"],
+            num_elements=model_config["num_elements"],
+            hidden_irreps=model_config["hidden_irreps"],
+            atomic_energies=model_config["atomic_energies"],
+            avg_num_neighbors=model_config["avg_num_neighbors"],
+            atomic_numbers=list(model_config["atomic_numbers"]),
+            correlation=correlation,
+            heads=heads,
+            atomic_inter_scale=args.std,
+            atomic_inter_shift=_determine_atomic_inter_shift(args.mean, heads),
+            embed_dim=int(args.num_channels),
+            n_layers=int(getattr(args, "ecenet_n_layers", 2)),
+            n_mp=int(getattr(args, "ecenet_n_mp", 1)),
+            n_max=int(getattr(args, "ecenet_n_max", 4)),
+            r_cut_neighbor=getattr(args, "ecenet_r_cut_neighbor", None),
+            self_tp=bool(getattr(args, "ecenet_self_tp", False)),
+            self_tp_full=bool(getattr(args, "ecenet_self_tp_full", False)),
+            self_tp_nu_max=getattr(args, "ecenet_self_tp_nu_max", None),
+            so2_linear=bool(getattr(args, "ecenet_so2_linear", False)),
+        )
     if args.model == "MagneticScaleShiftMACE":
         m_max = resolve_m_max(args.m_max, list(model_config["atomic_numbers"]))
         return modules.MagneticScaleShiftMACE(

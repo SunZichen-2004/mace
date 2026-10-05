@@ -181,6 +181,8 @@ def train(
     rank: Optional[int] = 0,
     data_aug_magmom: Optional[bool] = False,
     data_aug_magmom_mode: str = "non-soc",
+    test_loaders: Optional[Dict[str, DataLoader]] = None,
+    test_eval_interval: int = 0,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -360,6 +362,33 @@ def train(
             torch.distributed.broadcast(exit_now, src=0)
             if exit_now == 1:
                 break
+
+        if (
+            test_loaders
+            and test_eval_interval > 0
+            and (epoch + 1) % test_eval_interval == 0
+            and (exit_now is None or int(exit_now.item()) == 0)
+        ):
+            model_to_evaluate = model if distributed_model is None else distributed_model
+            param_context = ema.average_parameters() if ema is not None else nullcontext()
+            with param_context:
+                for test_loader_name, test_loader in test_loaders.items():
+                    test_loss, eval_metrics = evaluate(
+                        model=model_to_evaluate,
+                        loss_fn=loss_fn,
+                        data_loader=test_loader,
+                        output_args=output_args,
+                        device=device,
+                    )
+                    if rank == 0:
+                        valid_err_log(
+                            test_loss,
+                            eval_metrics,
+                            logger,
+                            log_errors,
+                            epoch,
+                            test_loader_name,
+                        )
 
         epoch += 1
 

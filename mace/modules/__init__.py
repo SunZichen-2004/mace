@@ -48,6 +48,8 @@ from .loss import (
     WeightedForcesLoss,
     WeightedHuberEnergyForcesStressLoss,
 )
+from .mece import MECE
+from .ecenet import ECENet
 from .models import (
     MACE,
     AtomicDielectricMACE,
@@ -119,6 +121,8 @@ __all__ = [
     "BesselBasis",
     "GaussianBasis",
     "MACE",
+    "MECE",
+    "ECENet",
     "ScaleShiftMACE",
     "MACELES",
     "AtomicDipolesMACE",
