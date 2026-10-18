@@ -78,6 +78,42 @@ from mace.tools.tables_utils import create_error_table
 from mace.tools.utils import AtomicNumberTable
 
 
+def _model_state_is_eqx(state_dict) -> bool:
+    return any(
+        ".conv_tp.eqx_tp." in key or ".conv_tp.projection." in key for key in state_dict
+    )
+
+
+def _load_latest_checkpoint(checkpoint_handler, device):
+    for swa in (True, False):
+        try:
+            loaded = checkpoint_handler.io.load_latest(swa=swa, device=device)
+        except Exception:  # pylint: disable=W0703
+            loaded = None
+        if loaded is not None:
+            return loaded
+    return None
+
+
+def _convert_polar_eqx(model):
+    from mace_eqx import convert_mace_to_eqx
+
+    logging.info(
+        "Converting %s interactions to EQX convolutions", model.__class__.__name__
+    )
+    converted = convert_mace_to_eqx(model, enable_cueq=False)
+    logging.info(
+        "EQX conversion finished, trainable parameters: %s",
+        tools.count_parameters(converted),
+    )
+    return converted
+
+
+def _rebuild_optimizer(args, model):
+    optimizer = get_optimizer(args, get_params_options(args, model))
+    return optimizer, LRScheduler(optimizer, args)
+
+
 def main() -> None:
     """
     This script runs the training/fine tuning for mace
@@ -652,7 +688,11 @@ def run(args) -> None:
             args.compute_polarizability = False
         elif (
             args.model == "Finetune_MACEPOLAR"
-            or args.loss == "energy_forces_dipole_quadrupole"
+            or args.loss
+            in (
+                "energy_forces_dipole_quadrupole",
+                "energy_forces_multipole_spin",
+            )
         ):
             args.compute_dipole = True
             args.compute_energy = True
@@ -987,7 +1027,54 @@ def run(args) -> None:
 
     start_epoch = 0
     opt_start_epoch = None
-    if args.restart_latest:
+    if getattr(args, "polar_use_eqx", False):
+        if args.enable_cueq or args.enable_oeq:
+            raise RuntimeError(
+                "--polar_use_eqx replaces the spatial convolution. "
+                "Disable --enable_cueq and --enable_oeq."
+            )
+        loaded = (
+            _load_latest_checkpoint(checkpoint_handler, device)
+            if args.restart_latest
+            else None
+        )
+        if args.restart_latest and loaded is None:
+            logging.warning(
+                "--restart_latest was requested but no checkpoint could be "
+                "loaded; training starts from scratch"
+            )
+        if loaded is not None and _model_state_is_eqx(loaded[0]["model"]):
+            checkpoint, epochs = loaded
+            model = _convert_polar_eqx(model)
+            optimizer, lr_scheduler = _rebuild_optimizer(args, model)
+            checkpoint_handler.builder.load_checkpoint(
+                state=tools.CheckpointState(model, optimizer, lr_scheduler),
+                checkpoint=checkpoint,
+                strict=False,
+            )
+            start_epoch = epochs
+            logging.info("Restored EQX checkpoint from epoch %s", epochs)
+        else:
+            if loaded is not None:
+                checkpoint, epochs = loaded
+                checkpoint_handler.builder.load_checkpoint(
+                    state=tools.CheckpointState(model, optimizer, lr_scheduler),
+                    checkpoint=checkpoint,
+                    strict=False,
+                )
+                start_epoch = epochs
+                logging.info(
+                    "Restored e3nn checkpoint from epoch %s, then converting to EQX",
+                    epochs,
+                )
+            model = _convert_polar_eqx(model)
+            optimizer, lr_scheduler = _rebuild_optimizer(args, model)
+            if loaded is not None:
+                logging.info(
+                    "Rebuilt the optimizer after EQX conversion. "
+                    "The e3nn optimizer state was not kept."
+                )
+    elif args.restart_latest:
         try:
             opt_start_epoch = checkpoint_handler.load_latest(
                 state=tools.CheckpointState(model, optimizer, lr_scheduler),

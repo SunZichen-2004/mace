@@ -22,9 +22,10 @@ def _load_macepolar_finetune(model, foundation, keep_atomic_energies: bool = Fal
     the new tensor-product weights unset. Those weights are zeroed after the
     load; doing it earlier would be overwritten if the checkpoint contained them.
 
-    When E0s come from an explicit table (a json file or a literal dict), the
-    model is already built with that table. The foundation checkpoint stores a
-    different atomic_energies_fn, and copying it back would replace the table.
+    When E0s come from an explicit table (a json file or a literal dict) or
+    from least squares on the training set (--E0s=average), the model is
+    already built with that table. The foundation checkpoint stores a different
+    atomic_energies_fn, and copying it back would replace the table.
     """
     src = foundation.state_dict()
     dst_shapes = {key: value.shape for key, value in model.state_dict().items()}
@@ -177,12 +178,22 @@ def configure_model(
             model_config_foundation["compute_polarizability"] = bool(
                 getattr(args, "compute_polarizability_from_electric_field", False)
             )
+            model_config_foundation["compute_spin_multipoles"] = bool(
+                getattr(args, "compute_spin_multipoles", False)
+            ) or args.loss == "energy_forces_multipole_spin"
+            model_config_foundation["spin_summed_field"] = bool(
+                getattr(args, "spin_summed_field", False)
+            )
             logging.info(
-                "Polar realspace_method=%s, dipole_from_field=%s, polarizability=%s, pred_dipole_key=%s",
+                "Polar realspace_method=%s, dipole_from_field=%s, polarizability=%s, spin_multipoles=%s, spin_summed_field=%s, pred_dipole_key=%s, fukui_regularisation=%s, dipole_cap=%s",
                 args.realspace_method,
                 model_config_foundation["compute_dipole_from_electric_field"],
                 model_config_foundation["compute_polarizability"],
+                model_config_foundation["compute_spin_multipoles"],
+                model_config_foundation["spin_summed_field"],
                 getattr(args, "pred_dipole_key", "dipole"),
+                getattr(args, "fukui_regularisation", None),
+                getattr(args, "dipole_cap", None),
             )
 
         if args.embedding_specs:
@@ -309,7 +320,8 @@ def configure_model(
                 "(MACE-POLAR-1-M)"
             )
         e0s_text = "" if args.E0s is None else str(args.E0s).strip().lower()
-        keep_atomic_energies = e0s_text not in ("", "foundation", "estimated", "average")
+        # "average" is the least-squares table already built into the model.
+        keep_atomic_energies = e0s_text not in ("", "foundation", "estimated")
         _load_macepolar_finetune(
             model,
             model_foundation,
@@ -437,6 +449,13 @@ def _build_model(
         args.model in ("PolarMACE", "Finetune_MACEPOLAR")
         and model_config_foundation is not None
     ):
+        # An explicit flag overrides the foundation. Unset keeps the checkpoint value.
+        if getattr(args, "fukui_regularisation", None) is not None:
+            model_config_foundation["fukui_regularisation"] = args.fukui_regularisation
+        if getattr(args, "dipole_cap", None) is not None:
+            model_config_foundation["dipole_cap"] = _parse_literal_or_none(
+                args.dipole_cap
+            )
         return modules.PolarMACE(**model_config_foundation)
     if args.model == "PolarMACE":
         field_feature_widths = _parse_literal_or_none(args.field_feature_widths)
@@ -485,6 +504,12 @@ def _build_model(
             compute_polarizability=bool(
                 getattr(args, "compute_polarizability_from_electric_field", False)
             ),
+            compute_spin_multipoles=bool(
+                getattr(args, "compute_spin_multipoles", False)
+            ),
+            spin_summed_field=bool(getattr(args, "spin_summed_field", False)),
+            fukui_regularisation=getattr(args, "fukui_regularisation", None) or 0.0,
+            dipole_cap=_parse_literal_or_none(getattr(args, "dipole_cap", None)),
         )
     if args.model == "FoundationMACE":
         return modules.ScaleShiftMACE(**model_config_foundation)

@@ -405,6 +405,48 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--compute_spin_multipoles",
+        help="PolarMACE: return the dipole and traceless quadrupole of rho_alpha - rho_beta",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--spin_summed_field",
+        help=(
+            "PolarMACE: feed the averaged alpha/beta field features into both "
+            "channels instead of the separate spin-resolved fields"
+        ),
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--fukui_regularisation",
+        help="PolarMACE: r in s/(s^2+(r*sum|f|)^2) replacing 1/s when normalising the signed "
+        "Fukui weights; bounds them where their sum cancels (0 = off; 0.1 recommended). "
+        "Unset: off for a new model, inherited when fine-tuning a foundation model",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--dipole_cap",
+        help="PolarMACE: '[onset, ceiling]' in e*A for a smooth cap on l=1 charge dipoles, or "
+        "'none' for no cap. Unset: no cap for a new model, inherited when fine-tuning a "
+        "foundation model",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--polar_use_eqx",
+        help=(
+            "PolarMACE: replace spatial interaction convolutions with EQX CUDA "
+            "kernels after foundation weights are loaded. Do not combine with "
+            "cueq or oeq. An e3nn checkpoint is loaded first and then converted; "
+            "its optimizer state is dropped because parameter names change."
+        ),
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
         "--pred_dipole_key",
         help=(
             "Which dipole enters the loss. dipole is the charge-density total_dipole; "
@@ -485,8 +527,9 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     # Dataset
     parser.add_argument(
         "--train_file",
-        help="Training set file, format is .xyz or .h5",
+        help="Training set file or files, format is .xyz or .h5",
         type=str,
+        nargs="+",
         required=False,
     )
     parser.add_argument(
@@ -733,6 +776,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=DefaultKeys.QUADRUPOLE.value,
     )
     parser.add_argument(
+        "--spin_dipole_key",
+        help="Key of reference spin dipoles in training xyz",
+        type=str,
+        default=DefaultKeys.SPIN_DIPOLE.value,
+    )
+    parser.add_argument(
+        "--spin_quadrupole_key",
+        help="Key of reference spin quadrupoles in training xyz",
+        type=str,
+        default=DefaultKeys.SPIN_QUADRUPOLE.value,
+    )
+    parser.add_argument(
         "--polarizability_key",
         help="Key of polarizability in training xyz",
         type=str,
@@ -827,6 +882,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "universal",
             "energy_forces_dipole",
             "energy_forces_dipole_quadrupole",
+            "energy_forces_multipole_spin",
             "l1l2energyforces",
         ],
     )
@@ -912,6 +968,34 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         dest="swa_quadrupole_weight",
+    )
+    parser.add_argument(
+        "--spin_dipole_weight",
+        help="weight of spin-dipole loss",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--swa_spin_dipole_weight",
+        "--stage_two_spin_dipole_weight",
+        help="weight of spin-dipole loss after starting Stage Two",
+        type=float,
+        default=0.0,
+        dest="swa_spin_dipole_weight",
+    )
+    parser.add_argument(
+        "--spin_quadrupole_weight",
+        help="weight of spin-quadrupole loss",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--swa_spin_quadrupole_weight",
+        "--stage_two_spin_quadrupole_weight",
+        help="weight of spin-quadrupole loss after starting Stage Two",
+        type=float,
+        default=0.0,
+        dest="swa_spin_quadrupole_weight",
     )
     parser.add_argument(
         "--swa_polarizability_weight",
@@ -1318,8 +1402,9 @@ def build_preprocess_arg_parser() -> argparse.ArgumentParser:
         )
     parser.add_argument(
         "--train_file",
-        help="Training set h5 file",
+        help="Training set xyz file or files",
         type=str,
+        nargs="+",
         default=None,
         required=True,
     )
@@ -1400,6 +1485,24 @@ def build_preprocess_arg_parser() -> argparse.ArgumentParser:
         help="Key of reference dipoles in training xyz",
         type=str,
         default=DefaultKeys.DIPOLE.value,
+    )
+    parser.add_argument(
+        "--quadrupole_key",
+        help="Key of reference quadrupoles in training xyz",
+        type=str,
+        default=DefaultKeys.QUADRUPOLE.value,
+    )
+    parser.add_argument(
+        "--total_charge_key",
+        help="Key of total charge in training xyz",
+        type=str,
+        default=DefaultKeys.TOTAL_CHARGE.value,
+    )
+    parser.add_argument(
+        "--total_spin_key",
+        help="Key of total spin in training xyz. MACE-POLAR uses multiplicity, 2S+1.",
+        type=str,
+        default=DefaultKeys.TOTAL_SPIN.value,
     )
     parser.add_argument(
         "--polarizability_key",

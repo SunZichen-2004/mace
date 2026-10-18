@@ -12,7 +12,29 @@ from mace.tools.cg import O3_e3nn
 from mace.tools.cg_cueq_tools import symmetric_contraction_proj
 from mace.tools.scripts_utils import extract_config_mace_model
 from mace.tools.torch_tools import restores_default_dtype
+import cuequivariance_torch as cuet
 
+
+def require_cueq_kernels(model):
+    polys = [m for m in model.modules() if isinstance(m, cuet.SegmentedPolynomial)]
+    methods = {m.method for m in polys}
+    cueq_methods = {}
+    for module in model.modules():
+        module_name = type(module).__module__ or ""
+        if "cuequivariance" in module_name and hasattr(module, "method"):
+            cueq_methods.setdefault(type(module).__name__, set()).add(module.method)
+    logging.info(
+        "require_cueq_kernels reached: SegmentedPolynomial n=%d methods=%s; "
+        "cueq module methods=%s",
+        len(polys),
+        sorted(methods),
+        {name: sorted(values) for name, values in sorted(cueq_methods.items())},
+    )
+
+    if methods == {"naive"}:
+        raise RuntimeError(
+            "cuEquivariance is running without CUDA kernels!"
+        )
 try:
     import cuequivariance as cue
 
@@ -267,6 +289,9 @@ def run(
         use_reduced_cg,
         keep_last_layer_irreps,
     )
+
+    if torch.device(device).type == "cuda":
+        require_cueq_kernels(target_model)
 
     if return_model:
         return target_model

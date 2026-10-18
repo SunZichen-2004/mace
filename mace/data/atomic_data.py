@@ -100,6 +100,8 @@ class AtomicData(torch_geometric.data.Data):
         fermi_level: Optional[torch.Tensor] = None,  # [,]
         external_field: Optional[torch.Tensor] = None,  # [1,3]
         quadrupole: Optional[torch.Tensor] = None,  # [1,3,3]
+        spin_dipole: Optional[torch.Tensor] = None,  # [1,3]
+        spin_quadrupole: Optional[torch.Tensor] = None,  # [1,3,3]
         **extra_data: torch.Tensor,
     ):
         # Check shapes
@@ -141,6 +143,8 @@ class AtomicData(torch_geometric.data.Data):
         assert fermi_level is None or len(fermi_level.shape) == 0
         assert external_field is None or external_field.shape == (1, 3)
         assert quadrupole is None or quadrupole.shape == (1, 3, 3)
+        assert spin_dipole is None or spin_dipole.shape == (1, 3)
+        assert spin_quadrupole is None or spin_quadrupole.shape == (1, 3, 3)
 
         # Aggregate data
         data = {
@@ -180,6 +184,8 @@ class AtomicData(torch_geometric.data.Data):
             "fermi_level": fermi_level,
             "external_field": external_field,
             "quadrupole": quadrupole,
+            "spin_dipole": spin_dipole,
+            "spin_quadrupole": spin_quadrupole,
         }
         data.update(extra_data)
         super().__init__(**data)
@@ -355,6 +361,21 @@ class AtomicData(torch_geometric.data.Data):
             if config.properties.get("quadrupole") is not None
             else torch.zeros(1, 3, 3, dtype=torch.get_default_dtype())
         )
+        spin_dipole = (
+            torch.tensor(
+                config.properties.get("spin_dipole"), dtype=torch.get_default_dtype()
+            ).reshape(1, 3)
+            if config.properties.get("spin_dipole") is not None
+            else torch.zeros(1, 3, dtype=torch.get_default_dtype())
+        )
+        spin_quadrupole = (
+            torch.tensor(
+                config.properties.get("spin_quadrupole"),
+                dtype=torch.get_default_dtype(),
+            ).reshape(1, 3, 3)
+            if config.properties.get("spin_quadrupole") is not None
+            else torch.zeros(1, 3, 3, dtype=torch.get_default_dtype())
+        )
         charges = (
             torch.tensor(
                 config.properties.get("charges"), dtype=torch.get_default_dtype()
@@ -472,6 +493,8 @@ class AtomicData(torch_geometric.data.Data):
             virials=virials,
             dipole=dipole,
             quadrupole=quadrupole,
+            spin_dipole=spin_dipole,
+            spin_quadrupole=spin_quadrupole,
             charges=charges,
             magmom=magmom,
             magforces=magforces,

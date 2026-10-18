@@ -6,6 +6,7 @@
 
 import dataclasses
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -66,8 +67,21 @@ def valid_err_log(
         error_e = eval_metrics["rmse_e_per_atom"] * 1e3
         error_f = eval_metrics["rmse_f"] * 1e3
         msg = (
-            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, "
-            f"RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
+            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}"
+        )
+        for key, label in (
+            ("loss_energy", "L_E"),
+            ("loss_forces", "L_F"),
+            ("loss_dipole", "L_mu"),
+            ("loss_quadrupole", "L_Q"),
+            ("loss_spin_dipole", "L_spin_mu"),
+            ("loss_spin_quadrupole", "L_spin_Q"),
+            ("loss_polarizability", "L_alpha"),
+        ):
+            if key in eval_metrics:
+                msg += f", {label}={eval_metrics[key]:.6f}"
+        msg += (
+            f", RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A"
         )
         if "rmse_mu" in eval_metrics:
             msg += f", RMSE_mu={eval_metrics['rmse_mu']:.6f} e·Å"
@@ -79,6 +93,13 @@ def valid_err_log(
             )
         if "rmse_quadrupole" in eval_metrics:
             msg += f", RMSE_Q={eval_metrics['rmse_quadrupole']:.6f} e·Å² traceless"
+        if "rmse_spin_dipole" in eval_metrics:
+            msg += f", RMSE_spin_mu={eval_metrics['rmse_spin_dipole']:.6f} e·Å"
+        if "rmse_spin_quadrupole" in eval_metrics:
+            msg += (
+                f", RMSE_spin_Q={eval_metrics['rmse_spin_quadrupole']:.6f}"
+                " e·Å² traceless"
+            )
         logging.info(msg)
     elif (
         log_errors == "PerAtomRMSEstressvirials"
@@ -211,19 +232,24 @@ def train(
     logging.info("Loss metrics on validation set")
     epoch = start_epoch
 
-    # log validation loss before _any_ training
-    for valid_loader_name, valid_loader in valid_loaders.items():
-        valid_loss_head, eval_metrics = evaluate(
-            model=model,
-            loss_fn=loss_fn,
-            data_loader=valid_loader,
-            output_args=output_args,
-            device=device,
-        )
-        valid_err_log(
-            valid_loss_head, eval_metrics, logger, log_errors, None, valid_loader_name
-        )
-    valid_loss = valid_loss_head  # consider only the last head for the checkpoint
+    # The stock loop evaluates the whole validation set before epoch 0.
+    # MACE_SKIP_INITIAL_EVAL=1 starts the epoch immediately; end-of-epoch
+    # evaluation is unchanged.
+    if os.environ.get("MACE_SKIP_INITIAL_EVAL", "") in ("1", "true", "True"):
+        logging.info("Skipping the validation pass that runs before epoch 0")
+    else:
+        for valid_loader_name, valid_loader in valid_loaders.items():
+            valid_loss_head, eval_metrics = evaluate(
+                model=model,
+                loss_fn=loss_fn,
+                data_loader=valid_loader,
+                output_args=output_args,
+                device=device,
+            )
+            valid_err_log(
+                valid_loss_head, eval_metrics, logger, log_errors, None, valid_loader_name
+            )
+        valid_loss = valid_loss_head  # consider only the last head for the checkpoint
 
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
     exit_now = torch.zeros(1, device=device) if distributed else None
@@ -502,6 +528,23 @@ def take_step(
             loss_dict["mae_mu_field"], loss_dict["rmse_mu_field"] = _mae_rmse(
                 batch.dipole - field_mu
             )
+        if (
+            output.get("quadrupole") is not None
+            and getattr(batch, "quadrupole", None) is not None
+        ):
+            from mace.modules.loss import _QUADRUPOLE_COMPONENTS
+            from mace.modules.utils import traceless_quadrupole
+
+            n_graphs = int(batch.ptr.numel() - 1)
+            pred_q = output["quadrupole"]
+            ref_q = traceless_quadrupole(batch.quadrupole.view(n_graphs, 3, 3))
+            delta_q = torch.stack(
+                [ref_q[:, i, j] - pred_q[:, i, j] for i, j in _QUADRUPOLE_COMPONENTS],
+                dim=-1,
+            )
+            loss_dict["mae_quadrupole"], loss_dict["rmse_quadrupole"] = _mae_rmse(
+                delta_q
+            )
 
     return loss, loss_dict
 
@@ -654,6 +697,16 @@ def evaluate(
 
 
 class MACELoss(Metric):
+    _LOSS_PART_NAMES = (
+        "energy",
+        "forces",
+        "dipole",
+        "quadrupole",
+        "spin_dipole",
+        "spin_quadrupole",
+        "polarizability",
+    )
+
     def __init__(self, loss_fn: torch.nn.Module):
         super().__init__()
         self.loss_fn = loss_fn
@@ -685,6 +738,14 @@ class MACELoss(Metric):
         self.add_state("Qs_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("delta_qs", default=[], dist_reduce_fx="cat")
         self.add_state(
+            "SpinMus_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
+        self.add_state("delta_spin_mus", default=[], dist_reduce_fx="cat")
+        self.add_state(
+            "SpinQs_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
+        self.add_state("delta_spin_qs", default=[], dist_reduce_fx="cat")
+        self.add_state(
             "polarizability_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
         )
         self.add_state("delta_polarizability", default=[], dist_reduce_fx="cat")
@@ -697,9 +758,30 @@ class MACELoss(Metric):
         )
         self.add_state("MagFs", default=[], dist_reduce_fx="cat")
         self.add_state("delta_MagFs", default=[], dist_reduce_fx="cat")
+        self.add_state(
+            "loss_part_sums",
+            default=torch.zeros(len(self._LOSS_PART_NAMES)),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "loss_part_seen",
+            default=torch.zeros(len(self._LOSS_PART_NAMES)),
+            dist_reduce_fx="sum",
+        )
 
     def update(self, batch, output):  # pylint: disable=arguments-differ
-        loss = self.loss_fn(pred=output, ref=batch)
+        if hasattr(self.loss_fn, "weighted_components"):
+            parts = self.loss_fn.weighted_components(ref=batch, pred=output)
+            loss = torch.zeros(
+                (), dtype=torch.get_default_dtype(), device=batch.energy.device
+            )
+            for name, value in parts.items():
+                loss = loss + value
+                index = self._LOSS_PART_NAMES.index(name)
+                self.loss_part_sums[index] += value.detach()
+                self.loss_part_seen[index] += 1
+        else:
+            loss = self.loss_fn(pred=output, ref=batch)
         self.total_loss += loss
         self.num_data += batch.num_graphs
 
@@ -792,6 +874,38 @@ class MACELoss(Metric):
                 torch.ones_like(batch.weight),
             )
         if (
+            output.get("spin_dipole") is not None
+            and getattr(batch, "spin_dipole", None) is not None
+        ):
+            self.delta_spin_mus.append(batch.spin_dipole - output["spin_dipole"])
+            self.SpinMus_computed += filter_nonzero_weight(
+                batch,
+                self.delta_spin_mus,
+                batch.weight,
+                torch.ones_like(batch.weight),
+            )
+        if (
+            output.get("spin_quadrupole") is not None
+            and getattr(batch, "spin_quadrupole", None) is not None
+        ):
+            from mace.modules.loss import _QUADRUPOLE_COMPONENTS
+            from mace.modules.utils import traceless_quadrupole
+
+            n_graphs = int(batch.ptr.numel() - 1)
+            pred_sq = output["spin_quadrupole"]
+            ref_sq = traceless_quadrupole(batch.spin_quadrupole.view(n_graphs, 3, 3))
+            delta_sq = torch.stack(
+                [ref_sq[:, i, j] - pred_sq[:, i, j] for i, j in _QUADRUPOLE_COMPONENTS],
+                dim=-1,
+            )
+            self.delta_spin_qs.append(delta_sq)
+            self.SpinQs_computed += filter_nonzero_weight(
+                batch,
+                self.delta_spin_qs,
+                batch.weight,
+                torch.ones_like(batch.weight),
+            )
+        if (
             output.get("polarizability") is not None
             and batch.polarizability is not None
         ):
@@ -832,6 +946,11 @@ class MACELoss(Metric):
 
         aux = defaultdict(NoneMultiply)
         aux["loss"] = to_numpy(self.total_loss / self.num_data).item()
+        for index, name in enumerate(self._LOSS_PART_NAMES):
+            if float(self.loss_part_seen[index]) > 0:
+                aux[f"loss_{name}"] = to_numpy(
+                    self.loss_part_sums[index] / self.num_data
+                ).item()
         if self.E_computed:
             delta_es = self.convert(self.delta_es)
             delta_es_per_atom = self.convert(self.delta_es_per_atom)
@@ -888,6 +1007,14 @@ class MACELoss(Metric):
             aux["mae_quadrupole"] = compute_mae(delta_qs)
             aux["rmse_quadrupole"] = compute_rmse(delta_qs)
             aux["q95_quadrupole"] = compute_q95(delta_qs)
+        if self.SpinMus_computed:
+            delta_spin_mus = self.convert(self.delta_spin_mus)
+            aux["mae_spin_dipole"] = compute_mae(delta_spin_mus)
+            aux["rmse_spin_dipole"] = compute_rmse(delta_spin_mus)
+        if self.SpinQs_computed:
+            delta_spin_qs = self.convert(self.delta_spin_qs)
+            aux["mae_spin_quadrupole"] = compute_mae(delta_spin_qs)
+            aux["rmse_spin_quadrupole"] = compute_rmse(delta_spin_qs)
         if self.polarizability_computed:
             delta_polarizability = self.convert(self.delta_polarizability)
             delta_polarizability_per_atom = self.convert(

@@ -10,6 +10,8 @@ class DefaultKeys(Enum):
     VIRIALS = "REF_virials"
     DIPOLE = "dipole"
     QUADRUPOLE = "quadrupole"
+    SPIN_DIPOLE = "spin_dipole"
+    SPIN_QUADRUPOLE = "spin_quadrupole"
     POLARIZABILITY = "polarizability"
     HEAD = "head"
     CHARGES = "REF_charges"

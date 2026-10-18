@@ -4,7 +4,7 @@
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -637,16 +637,27 @@ _QUADRUPOLE_COMPONENTS = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
 
 
 def weighted_mean_squared_error_quadrupole(
-    ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ref: Batch,
+    pred: TensorDict,
+    ddp: Optional[bool] = None,
+    key: str = "quadrupole",
 ) -> torch.Tensor:
     n_graphs = int(ref.ptr.numel() - 1)
-    pred_q = pred["quadrupole"]
-    ref_q = traceless_quadrupole(ref["quadrupole"].view(n_graphs, 3, 3))
+    pred_q = pred[key]
+    ref_q = traceless_quadrupole(ref[key].view(n_graphs, 3, 3))
     num_atoms = (ref.ptr[1:] - ref.ptr[:-1]).unsqueeze(-1)
     rows = []
     for i, j in _QUADRUPOLE_COMPONENTS:
         rows.append((ref_q[:, i, j] - pred_q[:, i, j]).unsqueeze(-1))
     raw_loss = torch.square(torch.cat(rows, dim=-1) / num_atoms)
+    return reduce_loss(raw_loss, ddp)
+
+
+def weighted_mean_squared_error_spin_dipole(
+    ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+) -> torch.Tensor:
+    num_atoms = (ref.ptr[1:] - ref.ptr[:-1]).unsqueeze(-1)
+    raw_loss = torch.square((ref["spin_dipole"] - pred["spin_dipole"]) / num_atoms)
     return reduce_loss(raw_loss, ddp)
 
 
@@ -700,13 +711,15 @@ class WeightedEnergyForcesDipoleLoss(torch.nn.Module):
         )
 
 
-class WeightedEnergyForcesDipoleQuadrupoleLoss(torch.nn.Module):
+class WeightedEnergyForcesMultipoleSpinLoss(torch.nn.Module):
     def __init__(
         self,
         energy_weight=1.0,
         forces_weight=1.0,
         dipole_weight=1.0,
         quadrupole_weight=1.0,
+        spin_dipole_weight=0.0,
+        spin_quadrupole_weight=0.0,
         polarizability_weight=0.0,
         pred_dipole_key: str = "dipole",
     ) -> None:
@@ -734,27 +747,60 @@ class WeightedEnergyForcesDipoleQuadrupoleLoss(torch.nn.Module):
             torch.tensor(quadrupole_weight, dtype=torch.get_default_dtype()),
         )
         self.register_buffer(
+            "spin_dipole_weight",
+            torch.tensor(spin_dipole_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "spin_quadrupole_weight",
+            torch.tensor(spin_quadrupole_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
             "polarizability_weight",
             torch.tensor(polarizability_weight, dtype=torch.get_default_dtype()),
         )
 
+    def weighted_components(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Weighted terms that sum to ``forward``. Missing predictions are omitted."""
+        parts: Dict[str, torch.Tensor] = {
+            "energy": self.energy_weight
+            * weighted_mean_squared_error_energy(ref, pred, ddp),
+            "forces": self.forces_weight * mean_squared_error_forces(ref, pred, ddp),
+            "dipole": self.dipole_weight
+            * dipole_mse_terms(ref, pred, ddp, self.pred_dipole_key),
+            "quadrupole": self.quadrupole_weight
+            * weighted_mean_squared_error_quadrupole(ref, pred, ddp),
+        }
+        if pred.get("spin_dipole") is not None and getattr(ref, "spin_dipole", None) is not None:
+            parts["spin_dipole"] = (
+                self.spin_dipole_weight
+                * weighted_mean_squared_error_spin_dipole(ref, pred, ddp)
+            )
+        if (
+            pred.get("spin_quadrupole") is not None
+            and getattr(ref, "spin_quadrupole", None) is not None
+        ):
+            parts["spin_quadrupole"] = (
+                self.spin_quadrupole_weight
+                * weighted_mean_squared_error_quadrupole(
+                    ref, pred, ddp, key="spin_quadrupole"
+                )
+            )
+        if self.polarizability_weight != 0:
+            parts["polarizability"] = (
+                self.polarizability_weight
+                * weighted_mean_squared_error_polarizability(ref, pred, ddp)
+            )
+        return parts
+
     def forward(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
-        loss_energy = weighted_mean_squared_error_energy(ref, pred, ddp)
-        loss_forces = mean_squared_error_forces(ref, pred, ddp)
-        loss_dipole = dipole_mse_terms(ref, pred, ddp, self.pred_dipole_key)
-        loss_quadrupole = weighted_mean_squared_error_quadrupole(ref, pred, ddp)
-        loss = (
-            self.energy_weight * loss_energy
-            + self.forces_weight * loss_forces
-            + self.dipole_weight * loss_dipole
-            + self.quadrupole_weight * loss_quadrupole
-        )
-        if self.polarizability_weight != 0:
-            loss = loss + self.polarizability_weight * weighted_mean_squared_error_polarizability(
-                ref, pred, ddp
-            )
+        parts = self.weighted_components(ref, pred, ddp)
+        loss = torch.zeros((), dtype=torch.get_default_dtype(), device=ref.energy.device)
+        for value in parts.values():
+            loss = loss + value
         return loss
 
     def __repr__(self):
@@ -762,6 +808,8 @@ class WeightedEnergyForcesDipoleQuadrupoleLoss(torch.nn.Module):
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f}, dipole_weight={self.dipole_weight:.3f}, "
             f"quadrupole_weight={self.quadrupole_weight:.3f}, "
+            f"spin_dipole_weight={self.spin_dipole_weight:.3f}, "
+            f"spin_quadrupole_weight={self.spin_quadrupole_weight:.3f}, "
             f"polarizability_weight={self.polarizability_weight:.3f}, "
             f"pred_dipole_key={self.pred_dipole_key})"
         )

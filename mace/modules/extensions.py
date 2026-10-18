@@ -688,9 +688,13 @@ class PolarMACE(ScaleShiftMACE):
         fixedpoint_update_config: Optional[Dict[str, Any]] = None,
         field_readout_config: Optional[Dict[str, Any]] = None,
         pbc_handling: str = "auto",
+        fukui_regularisation: float = 0.0,
+        dipole_cap: Optional[List[float]] = None,
         realspace_method: str = "finite_difference",
         compute_dipole_from_electric_field: bool = False,
         compute_polarizability: bool = False,
+        compute_spin_multipoles: bool = False,
+        spin_summed_field: bool = False,
         **kwargs,
     ):
         if not GRAPH_LONGRANGE_AVAILABLE:
@@ -759,6 +763,8 @@ class PolarMACE(ScaleShiftMACE):
         self.keep_last_layer_irreps = True
         self.compute_dipole_from_electric_field = compute_dipole_from_electric_field
         self.compute_polarizability = compute_polarizability
+        self.compute_spin_multipoles = compute_spin_multipoles
+        self.spin_summed_field = bool(spin_summed_field)
 
         # k-space cutoff heuristic
         kspace_cutoff = kspace_cutoff_factor * gto_basis_kspace_cutoff(
@@ -959,12 +965,104 @@ class PolarMACE(ScaleShiftMACE):
             realspace_method=realspace_method,
         )
         self.set_electrostatic_pbcs(pbc_handling)
+        if not 0.0 <= fukui_regularisation < 1.0:
+            raise ValueError(
+                f"fukui_regularisation needs 0 <= r < 1, got {fukui_regularisation}"
+            )
+        self.fukui_regularisation = float(fukui_regularisation)
+        self.dipole_cap = None
+        if dipole_cap is not None:
+            onset, ceiling = (float(x) for x in dipole_cap)
+            if not 0.0 < onset < ceiling:
+                raise ValueError(
+                    f"dipole_cap needs 0 < onset < ceiling, got {dipole_cap}"
+                )
+            if atomic_multipoles_max_l < 1:
+                raise ValueError("dipole_cap needs atomic_multipoles_max_l >= 1")
+            self.dipole_cap = [onset, ceiling]
         self.realspace_method = realspace_method
         self.return_electrostatic_potentials = return_electrostatic_potentials
         self.layer_feature_mixer = MultiLayerFeatureMixer(
             node_feats_irreps=hidden_irreps,
             num_interactions=num_interactions,
             cueq_config=cueq_config,
+        )
+
+    def _normalise_fukui(
+        self, fukui_sources: torch.Tensor, batch: torch.Tensor, num_graphs: int
+    ) -> torch.Tensor:
+        """Scale the Fukui sources to sum to one per graph and spin channel.
+
+        The sources are signed, so their sum can nearly cancel and dividing by it then
+        inflates individual weights without bound. With `fukui_regularisation = r` the
+        division is s / (s^2 + (r sum|f|)^2) and the weight it withholds is spread
+        evenly: the weights still sum to exactly one, stay smooth through s = 0 and
+        through any single source crossing zero, are bounded by ~1/(2r), and equal f / s
+        to within r^2 where the sum does not cancel.
+        """
+        r = getattr(self, "fukui_regularisation", 0.0)
+        if r > 0.0:
+            # Evaluated in float64: the weights are invariant to scaling a graph's sources,
+            # but squaring large float32 sources would overflow.
+            f = safe_double(fukui_sources)
+            count = scatter_sum(
+                src=torch.ones_like(f[:, :1]), index=batch, dim=0, dim_size=num_graphs
+            )[batch]
+            mean_sq = (
+                scatter_sum(src=f * f, index=batch, dim=0, dim_size=num_graphs)[batch]
+                / count
+            )
+            # A graph whose sources are all zero gets uniform weights. Substituting ones
+            # keeps every operand away from zero, so the double backward stays finite.
+            empty = mean_sq == 0
+            f = torch.where(empty, torch.ones_like(f), f)
+            mean_sq = torch.where(empty, torch.ones_like(mean_sq), mean_sq)
+            norm = scatter_sum(src=f, index=batch, dim=0, dim_size=num_graphs)[batch]
+            # sum|f| through a smooth |f| (softened by 1e-3 of the graph's rms source), so
+            # the forces stay continuous when a single source crosses zero.
+            smooth_abs = torch.sqrt(f * f + 1e-6 * mean_sq)
+            total_abs = scatter_sum(
+                src=smooth_abs, index=batch, dim=0, dim_size=num_graphs
+            )[batch]
+            eps2 = (r * total_abs) ** 2
+            denom = norm * norm + eps2
+            weights = f * norm / denom + eps2 / denom / count
+            return torch.where(empty, 1.0 / count, weights).to(fukui_sources.dtype)
+        norm = scatter_sum(
+            src=safe_double(fukui_sources), index=batch, dim=0, dim_size=num_graphs
+        )[batch].to(fukui_sources.dtype)
+        norm = torch.where(norm == 0, torch.ones_like(norm), norm)
+        return fukui_sources / norm
+
+    def _cap_charge_dipole(self, spin_charge_density: torch.Tensor) -> torch.Tensor:
+        """Smoothly cap each atom's l=1 charge dipole at `dipole_cap = [onset, ceiling]`.
+
+        Identity up to the onset, then a tanh to the ceiling matching value, slope and
+        curvature at the onset. The density is predicted, not solved for, so nothing
+        else bounds it on a structure unlike the training data. Monopoles and the spin
+        density pass through unchanged.
+        """
+        onset, ceiling = self.dipole_cap
+        # In float64, so squaring a large float32 dipole cannot overflow.
+        density = safe_double(spin_charge_density)
+        charge = density[:, 0, :] + density[:, 1, :]
+        spin = density[:, 0, :] - density[:, 1, :]
+        dipole = charge[:, 1:4]
+        # Clamp the squared norm, not the norm: the norm's second derivative is NaN at a
+        # zero dipole, and the force loss takes it.
+        sq = (dipole * dipole).sum(dim=-1, keepdim=True)
+        safe = torch.sqrt(torch.clamp(sq, min=onset**2))
+        width = ceiling - onset
+        capped = onset + width * torch.tanh((safe - onset) / width)
+        charge = torch.cat(
+            (charge[:, :1], dipole * capped / safe, charge[:, 4:]), dim=-1
+        )
+        rebuilt = 0.5 * torch.stack((charge + spin, charge - spin), dim=1)
+        # Rebuilding alpha and beta rounds, so keep the input bit-for-bit where inactive.
+        return torch.where(
+            (sq > onset**2).unsqueeze(1),
+            rebuilt.to(spin_charge_density.dtype),
+            spin_charge_density,
         )
 
     def __setstate__(self, state):
@@ -1181,17 +1279,9 @@ class PolarMACE(ScaleShiftMACE):
         fukui_to_mul_ir = getattr(self, "_fukui_to_mul_ir", None)
         if fukui_to_mul_ir is not None:
             fukui_input = fukui_to_mul_ir(fukui_input)
-        fukui_sources = self.fukui_source_map(fukui_input)
-        fukui_norm = scatter_sum(
-            src=safe_double(fukui_sources),
-            index=data["batch"],
-            dim=0,
-            dim_size=num_graphs,
-        )[data["batch"]].to(vectors.dtype)
-        fukui_norm = torch.where(
-            fukui_norm == 0, torch.ones_like(fukui_norm), fukui_norm
+        fukui_sources = self._normalise_fukui(
+            self.fukui_source_map(fukui_input), data["batch"], num_graphs
         )
-        fukui_sources = fukui_sources / fukui_norm
         Q_p_S = (data["total_charge"] + (data["total_spin"] - 1))[data["batch"]]
         Q_m_S = (data["total_charge"] - (data["total_spin"] - 1))[data["batch"]]
         pred_total_charges_0 = scatter_sum(
@@ -1207,7 +1297,8 @@ class PolarMACE(ScaleShiftMACE):
         spin_charge_density[:, 1, 0] = spin_charge_density[:, 1, 0] + fukui_sources[
             :, 1
         ] * ((Q_m_S / 2) - pred_total_charges_0[:, 1])
-        # print("spin_charge_density", spin_charge_density)
+        if getattr(self, "dipole_cap", None) is not None:
+            spin_charge_density = self._cap_charge_dipole(spin_charge_density)
 
         potential_features = torch.zeros(
             (data["batch"].size(-1), self.potential_irreps.dim),
@@ -1257,9 +1348,14 @@ class PolarMACE(ScaleShiftMACE):
                 field_feats_beta + half_external_field
             ) / self.field_feature_norms
 
-            potential_features = torch.cat(
-                (field_feats_alpha, field_feats_beta), dim=-1
-            )
+             # Spin-Summed Field
+            if self.spin_summed_field:
+                potential_features = (field_feats_alpha + field_feats_beta) / 2
+                potential_features = torch.cat([potential_features, potential_features], dim=-1)
+            else:
+                potential_features = torch.cat(
+                    (field_feats_alpha, field_feats_beta), dim=-1
+                )         
             charge_sources_out = self.field_dependent_charges_maps[i](
                 node_attrs=data["node_attrs"],
                 node_feats=features_mixed,
@@ -1281,16 +1377,9 @@ class PolarMACE(ScaleShiftMACE):
             )
             spin_charge_density = spin_charge_density + spin_charge_density_sources
 
-            fukui_norm2 = scatter_sum(
-                src=safe_double(current_fukui_sources),
-                index=data["batch"],
-                dim=0,
-                dim_size=num_graphs,
-            )[data["batch"]].to(vectors.dtype)
-            fukui_norm2 = torch.where(
-                fukui_norm2 == 0, torch.ones_like(fukui_norm2), fukui_norm2
+            current_fukui_sources = self._normalise_fukui(
+                current_fukui_sources, data["batch"], num_graphs
             )
-            current_fukui_sources = current_fukui_sources / fukui_norm2
             final_fukui_sources = current_fukui_sources
             pred_total_charges = scatter_sum(
                 src=safe_double(spin_charge_density[:, :, 0]),
@@ -1305,6 +1394,8 @@ class PolarMACE(ScaleShiftMACE):
             spin_charge_density[:, 1, 0] = spin_charge_density[
                 :, 1, 0
             ] + current_fukui_sources[:, 1] * ((Q_m_S / 2) - pred_total_charges[:, 1])
+            if getattr(self, "dipole_cap", None) is not None:
+                spin_charge_density = self._cap_charge_dipole(spin_charge_density)
 
         total_energy = e0 + inter_e
         local_q_e = self.local_electron_energy(
@@ -1413,7 +1504,21 @@ class PolarMACE(ScaleShiftMACE):
                     total_polarizability = total_polarizability.permute(1, 0, 2)
             if not compute_dipole_from_electric_field:
                 total_dipole_from_electric_field = None
-
+        spin_dipole: Optional[torch.Tensor] = None
+        spin_quadrupole: Optional[torch.Tensor] = None
+        if getattr(self, "compute_spin_multipoles", False):
+            _, spin_dipole = compute_total_charge_dipole_permuted(
+                spin_density_mul_ir, #[n_atoms, 4]
+                long_range_positions,
+                data["batch"],
+                num_graphs,
+            ) # spin_dipole: [n_graphs, 3]
+            spin_quadrupole = compute_traceless_quadrupole_permuted(
+                spin_density_mul_ir,
+                long_range_positions,
+                data["batch"],
+                num_graphs,
+            ) # spin_quadrupole: [n_graphs, 3, 3]
         quadrupole = compute_traceless_quadrupole_permuted(
             charge_density_mul_ir, long_range_positions, data["batch"], num_graphs
         )
@@ -1475,6 +1580,8 @@ class PolarMACE(ScaleShiftMACE):
             "polarizability": total_polarizability,
             "total_polarizability": total_polarizability,
             "quadrupole": quadrupole,
+            "spin_dipole": spin_dipole,
+            "spin_quadrupole": spin_quadrupole,
             "total_charge": total_charge,
             "electrostatic_energy": electro_energy,
             "electron_energy": le_total,

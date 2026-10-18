@@ -56,6 +56,8 @@ def update_keyspec_from_kwargs(
         "virials_key",
         "dipole_key",
         "quadrupole_key",
+        "spin_dipole_key",
+        "spin_quadrupole_key",
         "head_key",
         "elec_temp_key",
         "total_charge_key",

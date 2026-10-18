@@ -380,6 +380,8 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         )
         config["field_norm_factor"] = model.field_norm_factor
         config["field_si"] = model.field_si
+        config["fukui_regularisation"] = getattr(model, "fukui_regularisation", 0.0)
+        config["dipole_cap"] = getattr(model, "dipole_cap", None)
         config["pbc_handling"] = getattr(model, "pbc_handling", "auto")
         config["realspace_method"] = getattr(
             model, "realspace_method", "finite_difference"
@@ -390,6 +392,10 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         config["compute_polarizability"] = getattr(
             model, "compute_polarizability", False
         )
+        config["compute_spin_multipoles"] = getattr(
+            model, "compute_spin_multipoles", False
+        )
+        config["spin_summed_field"] = getattr(model, "spin_summed_field", False)
         config["fixedpoint_update_config"] = getattr(
             model, "_fixedpoint_update_config"
         ).copy()
@@ -842,18 +848,23 @@ def get_loss_fn(
             dipole_weight=args.dipole_weight,
             pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
         )
-    elif args.loss == "energy_forces_dipole_quadrupole":
+    elif args.loss in (
+        "energy_forces_multipole_spin",
+        "energy_forces_dipole_quadrupole",
+    ):
         assert dipole_only is False and compute_dipole is True
         polar_weight = (
             args.polarizability_weight
             if getattr(args, "compute_polarizability_from_electric_field", False)
             else 0.0
         )
-        loss_fn = modules.WeightedEnergyForcesDipoleQuadrupoleLoss(
+        loss_fn = modules.WeightedEnergyForcesMultipoleSpinLoss(
             energy_weight=args.energy_weight,
             forces_weight=args.forces_weight,
             dipole_weight=args.dipole_weight,
             quadrupole_weight=args.quadrupole_weight,
+            spin_dipole_weight=getattr(args, "spin_dipole_weight", 0.0),
+            spin_quadrupole_weight=getattr(args, "spin_quadrupole_weight", 0.0),
             polarizability_weight=polar_weight,
             pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
         )
@@ -917,22 +928,27 @@ def get_swa(
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
         )
-    elif args.loss == "energy_forces_dipole_quadrupole":
+    elif args.loss in (
+        "energy_forces_multipole_spin",
+        "energy_forces_dipole_quadrupole",
+    ):
         swa_polar_weight = (
             args.swa_polarizability_weight
             if getattr(args, "compute_polarizability_from_electric_field", False)
             else 0.0
         )
-        loss_fn_energy = modules.WeightedEnergyForcesDipoleQuadrupoleLoss(
+        loss_fn_energy = modules.WeightedEnergyForcesMultipoleSpinLoss(
             energy_weight=args.swa_energy_weight,
             forces_weight=args.swa_forces_weight,
             dipole_weight=args.swa_dipole_weight,
             quadrupole_weight=args.swa_quadrupole_weight,
+            spin_dipole_weight=getattr(args, "swa_spin_dipole_weight", 0.0),
+            spin_quadrupole_weight=getattr(args, "swa_spin_quadrupole_weight", 0.0),
             polarizability_weight=swa_polar_weight,
             pred_dipole_key=getattr(args, "pred_dipole_key", "dipole"),
         )
         logging.info(
-            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight}, quadrupole weight : {args.swa_quadrupole_weight} and learning rate : {args.swa_lr}"
+            f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight}, quadrupole weight : {args.swa_quadrupole_weight}, spin dipole weight : {args.swa_spin_dipole_weight}, spin quadrupole weight : {args.swa_spin_quadrupole_weight} and learning rate : {args.swa_lr}"
         )
     elif args.loss == "universal":
         loss_fn_energy = modules.UniversalLoss(
