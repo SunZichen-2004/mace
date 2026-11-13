@@ -168,7 +168,10 @@ def configure_model(
         model_config_foundation["atomic_energies"] = atomic_energies
         if args.model in ("PolarMACE", "Finetune_MACEPOLAR"):
             model_config_foundation["realspace_method"] = args.realspace_method
-            want_field_dipole = getattr(args, "pred_dipole_key", "dipole") in (
+            if getattr(args, "potential_feature_mode", "alpha_beta") == "charge_spin":
+                model_config_foundation["potential_feature_mode"] = "charge_spin"
+                model_config_foundation["spin_field_alpha"] = getattr(args, "spin_field_alpha", 0.5)
+            want_field_dipole = args.loss == "polar2" or getattr(args, "pred_dipole_key", "dipole") in (
                 "field",
                 "both",
             )
@@ -180,17 +183,13 @@ def configure_model(
             )
             model_config_foundation["compute_spin_multipoles"] = bool(
                 getattr(args, "compute_spin_multipoles", False)
-            ) or args.loss == "energy_forces_multipole_spin"
-            model_config_foundation["spin_summed_field"] = bool(
-                getattr(args, "spin_summed_field", False)
-            )
+            ) or args.loss in ("energy_forces_multipole_spin", "polar2")
             logging.info(
-                "Polar realspace_method=%s, dipole_from_field=%s, polarizability=%s, spin_multipoles=%s, spin_summed_field=%s, pred_dipole_key=%s, fukui_regularisation=%s, dipole_cap=%s",
+                "Polar realspace_method=%s, dipole_from_field=%s, polarizability=%s, spin_multipoles=%s, pred_dipole_key=%s, fukui_regularisation=%s, dipole_cap=%s",
                 args.realspace_method,
                 model_config_foundation["compute_dipole_from_electric_field"],
                 model_config_foundation["compute_polarizability"],
                 model_config_foundation["compute_spin_multipoles"],
-                model_config_foundation["spin_summed_field"],
                 getattr(args, "pred_dipole_key", "dipole"),
                 getattr(args, "fukui_regularisation", None),
                 getattr(args, "dipole_cap", None),
@@ -302,6 +301,7 @@ def configure_model(
             edge_irreps=o3.Irreps(args.edge_irreps) if args.edge_irreps else None,
             atomic_energies=atomic_energies,
             apply_cutoff=args.apply_cutoff,
+            readout_cls=modules.readout_classes[args.readout_cls],
             avg_num_neighbors=args.avg_num_neighbors,
             atomic_numbers=z_table.zs,
             use_reduced_cg=args.use_reduced_cg,
@@ -327,6 +327,24 @@ def configure_model(
             model_foundation,
             keep_atomic_energies=keep_atomic_energies,
         )
+    elif model_foundation is not None and args.loss == "polar2":
+        # Prepared POLAR-2 foundation includes both backbone heads and shared
+        # polar weights. The generic MACE loader only copies the backbone.
+        if model.heads != model_foundation.heads:
+            raise ValueError("POLAR-2 initialization requires matching prepared heads")
+        source = model_foundation.state_dict()
+        target = model.state_dict()
+        for key in target:
+            if key not in source:
+                raise ValueError(f"Missing POLAR-2 initialization tensor: {key}")
+            if source[key].numel() != target[key].numel():
+                raise ValueError(f"Incompatible POLAR-2 initialization tensor: {key}")
+            target[key] = source[key].reshape(target[key].shape)
+        unused = set(source) - set(target)
+        if any(not (k.endswith(".output_mask") or source[k].numel() == 0) for k in unused):
+            raise ValueError(f"Unexpected POLAR-2 initialization tensors: {unused}")
+        model.load_state_dict(target, strict=True)
+        logging.info("Loaded complete POLAR-2 foundation: %s tensors, shared POLAR parameters", len(target))
     elif model_foundation is not None:
         if getattr(args, "finetune_dipoles_polarizabilities", False):
             # MDP fine-tuning: dedicated loader that handles higher-order irreps
@@ -490,6 +508,7 @@ def _build_model(
             field_si=args.field_si,
             include_electrostatic_self_interaction=args.include_electrostatic_self_interaction,
             add_local_electron_energy=args.add_local_electron_energy,
+            add_electrostatic_energy=getattr(args, "add_electrostatic_energy", True),
             quadrupole_feature_corrections=args.quadrupole_feature_corrections,
             return_electrostatic_potentials=args.return_electrostatic_potentials,
             field_feature_norms=field_feature_norms,
@@ -507,7 +526,9 @@ def _build_model(
             compute_spin_multipoles=bool(
                 getattr(args, "compute_spin_multipoles", False)
             ),
-            spin_summed_field=bool(getattr(args, "spin_summed_field", False)),
+            potential_feature_mode=getattr(args, "potential_feature_mode", "alpha_beta"),
+            spin_field_alpha=getattr(args, "spin_field_alpha", 0.5),
+            recompute_field_after_scf=bool(getattr(args, "recompute_field_after_scf", False)),
             fukui_regularisation=getattr(args, "fukui_regularisation", None) or 0.0,
             dipole_cap=_parse_literal_or_none(getattr(args, "dipole_cap", None)),
         )

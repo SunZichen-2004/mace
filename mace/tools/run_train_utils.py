@@ -74,6 +74,10 @@ def load_dataset_for_path(
             for config in collection
         ]
 
+    if str(file_path).endswith(".polar2"):
+        from mace.data.polar2_dataset import Polar2Dataset
+        return Polar2Dataset(file_path, r_max, z_table.zs, heads)
+
     filepath = Path(file_path)
     if filepath.is_dir():
 

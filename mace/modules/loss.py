@@ -816,7 +816,7 @@ class WeightedEnergyForcesMultipoleSpinLoss(torch.nn.Module):
 
 
 class WeightedEnergyForcesL1L2Loss(torch.nn.Module):
-    def __init__(self, energy_weight=1.0, forces_weight=1.0) -> None:
+    def __init__(self, energy_weight=1.0, forces_weight=1.0, MM_forces_weight=1.0) -> None:
         super().__init__()
         self.register_buffer(
             "energy_weight",
@@ -827,15 +827,256 @@ class WeightedEnergyForcesL1L2Loss(torch.nn.Module):
             torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
         )
 
+        self.register_buffer(
+            "MM_forces_weight",
+            torch.tensor(MM_forces_weight, dtype=torch.get_default_dtype()),
+        )
+
     def forward(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
         loss_energy = weighted_mean_absolute_error_energy(ref, pred, ddp)
         loss_forces = mean_normed_error_forces(ref, pred, ddp)
-        return self.energy_weight * loss_energy + self.forces_weight * loss_forces
+        loss_MM_forces = loss_energy.new_zeros(())
+        if getattr(ref, "MM_forces", None) is not None:
+            loss_forces = mean_squared_error_forces(ref, pred, ddp)
+            if pred.get("MM_forces") is None:
+                raise ValueError("MM force targets require model MM_forces.")
+            if ref["MM_forces"].numel():
+                loss_MM_forces = reduce_loss(
+                    (ref["MM_forces"] - pred["MM_forces"]).square(), ddp
+                )
+        return (self.energy_weight * loss_energy + self.forces_weight * loss_forces
+                + self.MM_forces_weight * loss_MM_forces)
 
     def __repr__(self):
         return (
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f})"
         )
+
+
+def interaction_energy_error(ref: Batch, pred: TensorDict) -> torch.Tensor:
+    """Reference minus E(complex)-sum E(fragment), all from the current model."""
+    energies = pred["energy"]
+    terms = energies[ref.interaction_indices] * ref.interaction_coefficients
+    predicted = energies.new_zeros(ref.interaction_targets.shape).index_add(
+        0, ref.interaction_sample_ids, terms
+    )
+    return ref.interaction_targets - predicted
+
+
+def interaction_energy_l2(ref: Batch, pred: TensorDict, ddp=None) -> torch.Tensor:
+    error = interaction_energy_error(ref, pred) / ref.interaction_num_atoms
+    raw = ref.interaction_weights * error.square()
+    # An all-isolated local batch still participates in DDP count reduction.
+    total = raw.sum() + pred["energy"].sum() * 0.0
+    count = raw.new_tensor(raw.numel())
+    enabled = is_ddp_enabled() if ddp is None else ddp
+    if enabled and dist.is_initialized():
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        total = total * dist.get_world_size()
+    return total / count.clamp_min(1)
+
+
+def interaction_force_error(ref: Batch, pred: TensorDict):
+    forces = pred.get("forces")
+    if forces is None:
+        raise ValueError("Interaction-force loss requires computed atomic forces")
+    return ref.interaction_force_targets - (
+        forces[ref.interaction_force_full] - forces[ref.interaction_force_isolated])
+
+
+def interaction_force_l2(ref: Batch, pred: TensorDict, ddp=None):
+    error = interaction_force_error(ref, pred)
+    total = (ref.interaction_force_weights[:, None] * error.square()).sum() + pred["forces"].sum() * 0.0
+    count = error.new_tensor(error.numel())
+    enabled = is_ddp_enabled() if ddp is None else ddp
+    if enabled and dist.is_initialized():
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        total = total * dist.get_world_size()
+    return total / count.clamp_min(1)
+
+
+def interaction_base_view(ref: Batch, pred: TensorDict):
+    """Exclude generated fragment graphs from ordinary E/F/multipole losses.
+
+    This preserves the original batch's loss normalization and does not dilute
+    isolated-source supervision by the number/size of auxiliary fragments.
+    """
+    graph_ids, node_ids = ref.interaction_base_graphs, ref.interaction_base_nodes
+    sizes = (ref.ptr[1:] - ref.ptr[:-1])[graph_ids]
+    base = Batch(ptr=torch.cat((sizes.new_zeros(1), sizes.cumsum(0))))
+    node_fields = ("forces", "magforces", "charges", "magmom")
+    graph_fields = (
+        "energy",
+        "weight",
+        "energy_weight",
+        "forces_weight",
+        "stress_weight",
+        "virials_weight",
+        "dipole_weight",
+        "charges_weight",
+        "polarizability_weight",
+        "magforces_weight",
+        "spin_dipole_weight",
+        "spin_quadrupole_weight",
+        "quadrupole_weight",
+        "stress",
+        "virials",
+        "dipole",
+        "quadrupole",
+        "spin_dipole",
+        "spin_quadrupole",
+        "polarizability",
+        "total_charge",
+        "total_spin",
+    )
+    for key in graph_fields + node_fields:
+        value = getattr(ref, key, None)
+        if value is not None:
+            base[key] = value[node_ids if key in node_fields else graph_ids]
+    result = {}
+    for key in (
+        "energy",
+        "stress",
+        "virials",
+        "dipole",
+        "quadrupole",
+        "spin_dipole",
+        "spin_quadrupole",
+        "polarizability",
+        "total_dipole_from_electric_field",
+        "forces",
+        "magforces",
+        "charges",
+        "magmom",
+    ):
+        value = pred.get(key)
+        if value is not None:
+            result[key] = value[node_ids if key in node_fields else graph_ids]
+    return base, result
+
+
+class InteractionEnergyLoss(torch.nn.Module):
+    """Ordinary loss on source samples plus per-atom interaction-energy L2."""
+
+    def __init__(self, base_loss, interaction_energy_weight=100.0, interaction_force_weight=0.0):
+        super().__init__()
+        if not isinstance(
+            base_loss, (WeightedEnergyForcesLoss, WeightedEnergyForcesMultipoleSpinLoss)
+        ):
+            raise ValueError(
+                "Interaction training supports weighted or energy_forces_multipole_spin/dipole_quadrupole loss"
+            )
+        self.base_loss = base_loss
+        self.register_buffer(
+            "interaction_energy_weight",
+            torch.tensor(interaction_energy_weight, dtype=torch.get_default_dtype()),
+        )
+
+        if not 0 <= interaction_force_weight < float("inf"):
+            raise ValueError("interaction_force_weight must be finite and nonnegative")
+        self.register_buffer("interaction_force_weight", torch.tensor(
+            interaction_force_weight, dtype=torch.get_default_dtype()))
+
+    def weighted_components(self, ref, pred, ddp=None):
+        base_ref, base_pred = interaction_base_view(ref, pred)
+        if hasattr(self.base_loss, "weighted_components"):
+            parts = self.base_loss.weighted_components(base_ref, base_pred, ddp)
+        else:
+            parts = {
+                "energy": self.base_loss.energy_weight
+                * weighted_mean_squared_error_energy(base_ref, base_pred, ddp),
+                "forces": self.base_loss.forces_weight
+                * mean_squared_error_forces(base_ref, base_pred, ddp),
+            }
+        parts["interaction_energy"] = (
+            self.interaction_energy_weight * interaction_energy_l2(ref, pred, ddp)
+        )
+        if self.interaction_force_weight != 0:
+            parts["interaction_forces"] = self.interaction_force_weight * interaction_force_l2(ref, pred, ddp)
+        return parts
+
+    def forward(self, ref, pred, ddp=None):
+        return sum(self.weighted_components(ref, pred, ddp).values())
+
+
+def fragment_charge_spin_error(ref: Batch, pred: TensorDict):
+    """Reference minus sums of final atomic charge and signed spin monopoles."""
+    errors = []
+    for key, targets in (
+        ("charges", ref.fragment_charge_targets),
+        ("spins", ref.fragment_spin_targets),
+    ):
+        values = pred.get(key)
+        if values is None or values.numel() != ref.positions.shape[0]:
+            raise ValueError(
+                "Fragment loss requires final atomic charges and spins from the model"
+            )
+        values = values.reshape(-1)
+        totals = values.new_zeros(targets.shape).index_add(
+            0, ref.fragment_ids, values[ref.fragment_node_indices]
+        )
+        errors.append(targets - totals)
+    return tuple(errors)
+
+
+def fragment_charge_spin_l2(ref: Batch, pred: TensorDict, ddp=None):
+    errors = fragment_charge_spin_error(ref, pred)
+    count = errors[0].new_tensor(errors[0].numel())
+    enabled = is_ddp_enabled() if ddp is None else ddp
+    scale = 1
+    if enabled and dist.is_initialized():
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        scale = dist.get_world_size()
+    # All ranks participate even when some/all have no labeled fragments.
+    return tuple(
+        ((ref.fragment_weights * error.square()).sum() + pred[key].sum() * 0.0)
+        * scale
+        / count.clamp_min(1)
+        for error, key in zip(errors, ("charges", "spins"))
+    )
+
+
+class FragmentChargeSpinLoss(torch.nn.Module):
+    """Add per-fragment total charge/spin MSE; no atom-count division."""
+
+    def __init__(
+        self, base_loss, fragment_charge_weight=1000.0, fragment_spin_weight=1000.0
+    ):
+        super().__init__()
+        if not isinstance(
+            base_loss, (WeightedEnergyForcesLoss, WeightedEnergyForcesMultipoleSpinLoss)
+        ):
+            raise ValueError(
+                "Fragment training supports weighted and energy_forces_multipole_spin/dipole_quadrupole losses"
+            )
+        self.base_loss = base_loss
+        for name, value in (
+            ("fragment_charge_weight", fragment_charge_weight),
+            ("fragment_spin_weight", fragment_spin_weight),
+        ):
+            if not 0 <= value < float("inf"):
+                raise ValueError("Fragment loss weights must be finite and nonnegative")
+            self.register_buffer(
+                name, torch.tensor(value, dtype=torch.get_default_dtype())
+            )
+
+    def weighted_components(self, ref, pred, ddp=None):
+        if hasattr(self.base_loss, "weighted_components"):
+            parts = self.base_loss.weighted_components(ref, pred, ddp)
+        else:
+            parts = {
+                "energy": self.base_loss.energy_weight
+                * weighted_mean_squared_error_energy(ref, pred, ddp),
+                "forces": self.base_loss.forces_weight
+                * mean_squared_error_forces(ref, pred, ddp),
+            }
+        charge, spin = fragment_charge_spin_l2(ref, pred, ddp)
+        parts["fragment_charge"] = self.fragment_charge_weight * charge
+        parts["fragment_spin"] = self.fragment_spin_weight * spin
+        return parts
+
+    def forward(self, ref, pred, ddp=None):
+        return sum(self.weighted_components(ref, pred, ddp).values())

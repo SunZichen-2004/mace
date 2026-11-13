@@ -374,6 +374,9 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
             model.include_electrostatic_self_interaction
         )
         config["add_local_electron_energy"] = model.add_local_electron_energy
+        config["add_electrostatic_energy"] = getattr(
+            model, "add_electrostatic_energy", True
+        )
         config["quadrupole_feature_corrections"] = model.quadrupole_feature_corrections
         config["return_electrostatic_potentials"] = (
             model.return_electrostatic_potentials
@@ -395,10 +398,23 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         config["compute_spin_multipoles"] = getattr(
             model, "compute_spin_multipoles", False
         )
-        config["spin_summed_field"] = getattr(model, "spin_summed_field", False)
+        config["potential_feature_mode"] = getattr(
+            model, "potential_feature_mode", "alpha_beta",
+        )
+        config["spin_field_alpha"] = getattr(model, "spin_field_alpha", 0.5)
+        config["recompute_field_after_scf"] = getattr(model, "recompute_field_after_scf", False)
         config["fixedpoint_update_config"] = getattr(
             model, "_fixedpoint_update_config"
         ).copy()
+        # Legacy checkpoints predate this option; preserve their actual modules
+        # when reconstructing the model for another equivariance backend.
+        if (
+            config["fixedpoint_update_config"].get("type")
+            == "AgnosticEmbeddedOneBodyVariableUpdate"
+        ):
+            config["fixedpoint_update_config"]["use_tp_mix"] = (
+                getattr(model.field_dependent_charges_maps[0], "tp_mix", None) is not None
+            )
         config["field_readout_config"] = getattr(model, "_field_readout_config").copy()
         config["keep_last_layer_irreps"] = model.keep_last_layer_irreps
     return config
@@ -790,7 +806,10 @@ def get_loss_fn(
     dipole_only: bool,
     compute_dipole: bool,
 ) -> torch.nn.Module:
-    if args.loss == "weighted":
+    if args.loss == "polar2":
+        from mace.modules.polar2_loss import POLAR2Loss
+        loss_fn = POLAR2Loss(**{k + "_weight": getattr(args, k + "_weight") for k in ("energy", "forces", "MM_forces", "dipole", "quadrupole", "spin_dipole", "spin_quadrupole", "polarizability")})
+    elif args.loss == "weighted":
         loss_fn = modules.WeightedEnergyForcesLoss(
             energy_weight=args.energy_weight, forces_weight=args.forces_weight
         )
@@ -870,7 +889,32 @@ def get_loss_fn(
         )
     else:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
+    if getattr(args, "interaction_energy_training", False):
+        from mace.modules.loss import InteractionEnergyLoss
+
+        loss_fn = InteractionEnergyLoss(loss_fn, args.interaction_energy_weight, getattr(args, "interaction_force_weight", 0.0))
+    if getattr(args, "fragment_charge_spin_training", False):
+        from mace.modules.loss import FragmentChargeSpinLoss
+
+        loss_fn = FragmentChargeSpinLoss(loss_fn, args.fragment_charge_weight, args.fragment_spin_weight)
+    loss_fn = _add_gaussian_multipole_loss(args, loss_fn)
     return loss_fn
+
+
+def _add_gaussian_multipole_loss(args, base_loss):
+    if not getattr(args, "gaussian_weighted_multipole_training", False):
+        return base_loss
+    if getattr(args, "interaction_energy_training", False) or getattr(args, "fragment_charge_spin_training", False):
+        raise ValueError("Gaussian-window supervision is not yet combined with generated fragment/interaction datasets")
+    if args.loss not in ("energy_forces_multipole_spin", "energy_forces_dipole_quadrupole"):
+        raise ValueError("Gaussian-window supervision requires energy_forces_multipole_spin loss")
+    from mace.modules.gaussian_loss import GaussianMultipoleLoss
+    result = GaussianMultipoleLoss(base_loss, tau=args.gaussian_tau, sigma=args.gaussian_sigma,
+                                  weight=args.gaussian_multipole_weight,
+                                  **{name + "_weight": getattr(args, "gaussian_" + name + "_weight", None)
+                                     for name in ("charge", "dipole", "spin", "spin_dipole")})
+    logging.info("Online MBIS Gaussian-window supervision: %s", result)
+    return result
 
 
 def get_swa(
@@ -969,6 +1013,15 @@ def get_swa(
         logging.info(
             f"Stage Two (after {args.start_swa} epochs) with loss function: {loss_fn_energy}, with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight} and learning rate : {args.swa_lr}"
         )
+    if getattr(args, "interaction_energy_training", False):
+        from mace.modules.loss import InteractionEnergyLoss
+
+        loss_fn_energy = InteractionEnergyLoss(loss_fn_energy, args.interaction_energy_weight, getattr(args, "interaction_force_weight", 0.0))
+    if getattr(args, "fragment_charge_spin_training", False):
+        from mace.modules.loss import FragmentChargeSpinLoss
+
+        loss_fn_energy = FragmentChargeSpinLoss(loss_fn_energy, args.fragment_charge_weight, args.fragment_spin_weight)
+    loss_fn_energy = _add_gaussian_multipole_loss(args, loss_fn_energy)
     swa = SWAContainer(
         model=AveragedModel(model),
         scheduler=SWALR(
@@ -1172,6 +1225,10 @@ def get_params_options(
             "their submodules to the parameter groups in get_params_options:\n"
             + "\n".join(unregistered_parameter_names)
         )
+    if args.optimizer == "muon":
+        parameter_names = {id(p): name for name, p in model.named_parameters()}
+        for group in param_options["params"]:
+            group["param_names"] = [parameter_names[id(p)] for p in group["params"]]
     return param_options
 
 
@@ -1180,6 +1237,19 @@ def get_optimizer(
 ) -> torch.optim.Optimizer:
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(**param_options)
+    elif args.optimizer == "muon":
+        from mace.tools.muon import MuonAdamW
+
+        optimizer = MuonAdamW(
+            param_options["params"],
+            lr=param_options["lr"],
+            muon_lr=args.muon_lr,
+            momentum=args.muon_momentum,
+            ns_steps=args.muon_ns_steps,
+            adjust_lr_fn=args.muon_adjust_lr_fn,
+            betas=param_options["betas"],
+            amsgrad=param_options["amsgrad"],
+        )
     elif args.optimizer == "schedulefree":
         try:
             from schedulefree import adamw_schedulefree
@@ -1321,7 +1391,7 @@ def check_path_ase_read(filename: Optional[str]) -> bool:
                 print(file)
             raise RuntimeError(f"No supported files found in directory '{filename}'")
         return False
-    if filepath.suffix in (".h5", ".hdf5", ".lmdb", ".aselmdb", ".mdb"):
+    if filepath.suffix in (".h5", ".hdf5", ".lmdb", ".aselmdb", ".mdb", ".polar2"):
         return False
     return True
 

@@ -14,7 +14,11 @@ import torch
 from e3nn import nn, o3
 from e3nn.util.jit import compile_mode
 
-from mace.modules.blocks import GeneralNonLinearBiasReadoutBlock
+from mace.modules.blocks import (
+    EquivariantProductBasisBlock,
+    GeneralNonLinearBiasReadoutBlock,
+    RealAgnosticResidualInteractionBlock,
+)
 from mace.modules.irreps_tools import tp_out_irreps_with_instructions
 from mace.modules.radial import RadialMLP
 
@@ -274,6 +278,7 @@ class FieldUpdateBlock(torch.nn.Module):
         edge_index: torch.Tensor,
         potential_features: torch.Tensor,
         local_charges: torch.Tensor,
+        cutoff: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # pragma: no cover - abstract
         ...
 
@@ -514,6 +519,7 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         ] = AgnosticChargeBiasedLinearPotentialEmbedding,
         nonlinearity_cls: Type[torch.nn.Module] = NoNonLinearity,
         num_elements: Optional[int] = None,
+        use_tp_mix: bool = True,
         **kwargs,
     ) -> None:
         _ = (nonlinearity_cls, num_elements)
@@ -598,18 +604,21 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             target=layout_str,
             cueq_config=self.cueq_config,
         )
-        mix_instructions = uvu_instructions_into(
-            self.node_feats_irreps,
-            self.node_feats_irreps,
-            self.node_feats_irreps,
-        )
-        self.tp_mix = SparseUvuTensorProduct(
-            irreps_in1=self.node_feats_irreps,
-            irreps_in2=self.node_feats_irreps,
-            irreps_out=self.node_feats_irreps,
-            instructions=mix_instructions,
-            layout=layout_str,
-        )
+        # Disable at construction: no weights, optimizer state, or forward work.
+        if use_tp_mix:
+            mix_instructions = uvu_instructions_into(
+                self.node_feats_irreps,
+                self.node_feats_irreps,
+                self.node_feats_irreps,
+            )
+            self.tp_mix = SparseUvuTensorProduct(
+                irreps_in1=self.node_feats_irreps,
+                irreps_in2=self.node_feats_irreps,
+                irreps_out=self.node_feats_irreps,
+                instructions=mix_instructions,
+                layout=layout_str,
+            )
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -619,6 +628,7 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         edge_index: torch.Tensor,
         potential_features: torch.Tensor,
         local_charges: torch.Tensor,
+        cutoff: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # create pot feats
         mixed_feats = self.potential_embedding(
@@ -629,7 +639,11 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         )
         invariant_descriptors = self.dot_products(node_feats, mixed_feats)
         # uvu: u = mixed_feats (field), v = node_feats. l x 0 -> l follows u.
-        equivariant_descriptors = self.tp_mix(mixed_feats, node_feats)
+        # Released Polar checkpoints predate tp_mix. Keep their original
+        # update path while using this extra term for newer checkpoints.
+        equivariant_descriptors = (
+            self.tp_mix(mixed_feats, node_feats) if hasattr(self, "tp_mix") else 0
+        )
         source_embedding = self.source_embedding(node_attrs)
         invariant_descriptors_embedded = torch.cat(
             [invariant_descriptors, source_embedding], dim=-1
@@ -645,6 +659,274 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         if readout_from_mul_ir is not None:
             multipoles = readout_from_mul_ir(multipoles)
         return multipoles
+
+
+@compile_mode("script")
+class PairwiseGatedMultipoleUpdate(FieldUpdateBlock):
+    """Gate geometry, pure field, and the existing sparse TP(V, h) paths.
+
+    V = F + L_p(p) + L_h(h) + c_0; gates use only TP_0(h, V) and
+    element features. There is no standalone density output stream.
+    See field_block_equations.md for channel-explicit equations. This replaces
+    the former six-pair gate architecture and requires newly trained weights.
+    """
+
+    def _setup(self, step_scale: float = 0.25, **kwargs) -> None:
+        _ = kwargs
+        if not 0.0 < step_scale <= 1.0:
+            raise ValueError("step_scale must be in (0, 1]")
+        self.step_scale = step_scale
+        irreps = self.node_feats_irreps
+        layout = (
+            self.cueq_config.layout_str
+            if self.cueq_config is not None and self.cueq_config.enabled
+            else "mul_ir"
+        )
+        self.h_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=irreps, source=layout, target="mul_ir", cueq_config=self.cueq_config
+        )
+        self.v_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.potential_irreps,
+            source=layout,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self.p_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.charges_irreps,
+            source=layout,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self.out_from_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.charges_irreps + o3.Irreps("2x0e"),
+            source="mul_ir",
+            target=layout,
+            cueq_config=self.cueq_config,
+        )
+        self.v_linear = o3.Linear(self.potential_irreps, irreps)
+        # Only 0e outputs receive an embedding bias; F remains a pure field map.
+        self.h_linear = o3.Linear(irreps, irreps, biases=True)
+        self.p_linear = o3.Linear(self.charges_irreps, irreps)
+
+        self._blocks: List[Tuple[int, int, int, int, int]] = []
+        channel_start = 0
+        for (mul, ir), sl in zip(irreps, irreps.slices()):
+            self._blocks.append((sl.start, sl.stop, mul, ir.dim, channel_start))
+            channel_start += mul
+        scalar_channels = irreps.count(o3.Irrep("0e"))
+        if scalar_channels == 0:
+            raise ValueError("PairwiseGatedMultipoleUpdate requires 0e channels")
+        self.element_embedding = o3.Linear(
+            self.node_attrs_irreps, o3.Irreps(f"{scalar_channels}x0e")
+        )
+        if any(mul != scalar_channels for mul, _ir in irreps):
+            raise ValueError(
+                "PairwiseGatedMultipoleUpdate requires equal channel counts "
+                "for all irreps, matching the original sparse contraction"
+            )
+        invariant_irreps = o3.Irreps(f"{scalar_channels}x0e")
+        self.dot_products = SparseUvuTensorProduct(
+            irreps_in1=irreps,
+            irreps_in2=irreps,
+            irreps_out=invariant_irreps,
+            instructions=instructions_for_sparse_tp(irreps, irreps, invariant_irreps),
+            layout="mul_ir",
+        )
+        # Match the original tp_mix input order and supported angular paths.
+        self.tp_mix = SparseUvuTensorProduct(
+            irreps_in1=irreps,
+            irreps_in2=irreps,
+            irreps_out=irreps,
+            instructions=uvu_instructions_into(irreps, irreps, irreps),
+            layout="mul_ir",
+        )
+        self.gate_mlp = RadialMLP(
+            [2 * scalar_channels, 64, 64, 64, 3 * channel_start]
+        )
+        readout_irreps = (
+            (32 * o3.Irreps.spherical_harmonics(self.charges_irreps.lmax))
+            .sort()[0]
+            .simplify()
+        )
+        self.readout = GeneralNonLinearBiasReadoutBlock(
+            irreps_in=irreps,
+            MLP_irreps=readout_irreps,
+            gate=torch.nn.functional.silu,
+            irreps_out=self.charges_irreps + o3.Irreps("2x0e"),
+            cueq_config=None,
+        )
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        potential_features: torch.Tensor,
+        local_charges: torch.Tensor,
+        cutoff: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        _ = (edge_attrs, edge_feats, edge_index)
+        h_in = node_feats
+        v_in = potential_features
+        p_in = local_charges
+        if self.h_to_mul_ir is not None:
+            h_in = self.h_to_mul_ir(h_in)
+        if self.v_to_mul_ir is not None:
+            v_in = self.v_to_mul_ir(v_in)
+        if self.p_to_mul_ir is not None:
+            p_in = self.p_to_mul_ir(p_in)
+        # Use raw backbone h; its learned projection appears only inside V.
+        h = h_in
+        field = self.v_linear(v_in)
+        mixed = field + self.h_linear(h) + self.p_linear(p_in)
+        descriptors = torch.cat(
+            [self.dot_products(h, mixed), self.element_embedding(node_attrs)], dim=-1
+        )
+        gates = self.gate_mlp(descriptors).reshape(h.shape[0], 3, -1)
+        tp_feats = self.tp_mix(mixed, h)
+        out_blocks: List[torch.Tensor] = []
+        for start, stop, mul, dim, channel_start in self._blocks:
+            block = h.new_zeros((h.shape[0], mul, dim))
+            for stream, x in enumerate((h, field, tp_feats)):
+                gate = gates[:, stream, channel_start : channel_start + mul]
+                block = block + gate.unsqueeze(-1) * x[:, start:stop].reshape(-1, mul, dim)
+            out_blocks.append(block.reshape(h.shape[0], -1))
+        out = self.readout(torch.cat(out_blocks, dim=-1))
+        out = torch.cat(
+            [
+                out[:, : self.charges_irreps.dim] * self.step_scale,
+                out[:, self.charges_irreps.dim :],
+            ],
+            dim=-1,
+        )
+        if self.out_from_mul_ir is not None:
+            out = self.out_from_mul_ir(out)
+        return out
+
+
+class MessagePassingMultipoleUpdate(FieldUpdateBlock):
+    """One MACE interaction/product on the field-conditioned node features V."""
+
+    def _setup(
+        self,
+        num_channels: int = 128,
+        correlation: int = 3,
+        step_scale: float = 0.25,
+        **kwargs,
+    ) -> None:
+        _ = kwargs
+        if num_channels < 1 or correlation not in (2, 3):
+            raise ValueError("Positive num_channels and correlation 2 or 3 required")
+        if not 0.0 < step_scale <= 1.0:
+            raise ValueError("step_scale must be in (0, 1]")
+        self.step_scale = step_scale
+        self.correlation = correlation
+        self.message_irreps = o3.Irreps(f"{num_channels}x0e + {num_channels}x1o")
+        if self.charges_irreps.lmax > 1:
+            raise ValueError("MessagePassingMultipoleUpdate supports multipoles l <= 1")
+        # Share W^v between spins: project v_up + v_down as in F_{i,klm}.
+        half = len(self.potential_irreps) // 2
+        field_irreps = self.potential_irreps[:half]
+        if self.potential_irreps != field_irreps + field_irreps:
+            raise ValueError("Expected two concatenated spin potential irreps")
+        self.field_dim = field_irreps.dim
+        self.v_linear = Linear(
+            field_irreps, self.message_irreps, cueq_config=self.cueq_config
+        )
+        self.h_linear = Linear(
+            self.node_feats_irreps, self.message_irreps, cueq_config=self.cueq_config
+        )
+        self.scalar_bias = torch.nn.Parameter(torch.zeros(num_channels))
+        self.p_linear = Linear(
+            self.charges_irreps, self.message_irreps, cueq_config=self.cueq_config
+        )
+        self.interaction = RealAgnosticResidualInteractionBlock(
+            node_attrs_irreps=self.node_attrs_irreps,
+            node_feats_irreps=self.message_irreps,
+            edge_attrs_irreps=o3.Irreps.spherical_harmonics(1),
+            edge_feats_irreps=self.edge_feats_irreps,
+            target_irreps=self.message_irreps,
+            hidden_irreps=self.message_irreps,
+            avg_num_neighbors=self.avg_num_neighbors,
+            radial_MLP=self.radial_MLP,
+            cueq_config=self.cueq_config,
+            oeq_config=self.oeq_config,
+        )
+        self.product = EquivariantProductBasisBlock(
+            node_feats_irreps=self.message_irreps,
+            target_irreps=self.message_irreps,
+            correlation=correlation,
+            num_elements=self.node_attrs_irreps.dim,
+            use_sc=True,
+            use_reduced_cg=False,
+            cueq_config=self.cueq_config,
+            oeq_config=self.oeq_config,
+        )
+        layout = (
+            self.cueq_config.layout_str
+            if self.cueq_config is not None and self.cueq_config.enabled
+            else "mul_ir"
+        )
+        self.readout_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.message_irreps,
+            source=layout,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self.out_from_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.charges_irreps + o3.Irreps("2x0e"),
+            source="mul_ir",
+            target=layout,
+            cueq_config=self.cueq_config,
+        )
+        self.readout = GeneralNonLinearBiasReadoutBlock(
+            irreps_in=self.message_irreps,
+            MLP_irreps=o3.Irreps("32x0e + 32x1o"),
+            gate=torch.nn.functional.silu,
+            irreps_out=self.charges_irreps + o3.Irreps("2x0e"),
+            cueq_config=None,
+        )
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        potential_features: torch.Tensor,
+        local_charges: torch.Tensor,
+        cutoff: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        mixed = (
+            self.v_linear(
+                potential_features[:, : self.field_dim]
+                + potential_features[:, self.field_dim :]
+            )
+            + self.h_linear(node_feats)
+            + self.p_linear(local_charges)
+        )
+        mixed = mixed + torch.cat(
+            [self.scalar_bias, self.scalar_bias.new_zeros(3 * self.scalar_bias.numel())]
+        )
+        message, sc = self.interaction(
+            node_attrs, mixed, edge_attrs[:, :4], edge_feats, edge_index, cutoff=cutoff
+        )
+        features = self.product(message, sc, node_attrs)
+        if self.readout_to_mul_ir is not None:
+            features = self.readout_to_mul_ir(features)
+        out = self.readout(features)
+        if self.out_from_mul_ir is not None:
+            out = self.out_from_mul_ir(out)
+        return torch.cat(
+            [
+                out[:, : self.charges_irreps.dim] * self.step_scale,
+                out[:, self.charges_irreps.dim :],
+            ],
+            dim=-1,
+        )
 
 
 class PostScfReadout(torch.nn.Module):
@@ -805,11 +1087,243 @@ class OneBodyMLPFieldReadout(PostScfReadout):
         return self.mlp(invar_feats).squeeze(-1)
 
 
+@compile_mode("script")
+class OneBodyTPMLPFieldReadout(PostScfReadout):
+    """Read energy from the scalar part of V and its learned self-contractions.
+
+    LayerNorm is optional and acts only on the invariant TP output. It is off
+    by default because the magnitude of the electronic response carries useful
+    information, which per-atom normalization can suppress.
+    """
+
+    def _setup(
+        self,
+        layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+        **kwargs,
+    ) -> None:
+        _ = kwargs
+        channels = self.node_feats_irreps.count(o3.Irrep("0e"))
+        if channels == 0:
+            raise ValueError("OneBodyTPMLPFieldReadout needs at least one 0e channel")
+        if layer_norm and channels == 1:
+            raise ValueError("LayerNorm needs at least two TP invariant channels")
+        if layer_norm_eps <= 0:
+            raise ValueError("layer_norm_eps must be positive")
+
+        # Every uvu path must have the output scalar block's multiplicity.
+        # Project to a common width even if the backbone's irreps have different
+        # multiplicities; retain its spatial irrep types.
+        self.v_irreps = o3.Irreps(
+            [(channels, ir) for _, ir in self.node_feats_irreps.sort()[0].simplify()]
+        )
+        invar_irreps = o3.Irreps(f"{channels}x0e")
+        self.linear_up_q = o3.Linear(self.charges_irreps, self.v_irreps, biases=True)
+        self.linear_up_v = o3.Linear(self.potential_irreps, self.v_irreps, biases=True)
+        self.linear_up_node = o3.Linear(self.node_feats_irreps, self.v_irreps)
+
+        layout_str = (
+            self.cueq_config.layout_str
+            if self.cueq_config is not None and self.cueq_config.enabled
+            else "mul_ir"
+        )
+        # Keep all three embeddings and the TP in e3nn's mul_ir layout, avoiding
+        # a round trip back to the backend layout before the scalar readout.
+        self._q_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.charges_irreps,
+            source=layout_str,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self._v_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.potential_irreps,
+            source=layout_str,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self._node_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.node_feats_irreps,
+            source=layout_str,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self.self_tp = SparseUvuTensorProduct(
+            irreps_in1=self.v_irreps,
+            irreps_in2=self.v_irreps,
+            irreps_out=invar_irreps,
+            instructions=instructions_for_sparse_tp(
+                self.v_irreps, self.v_irreps, invar_irreps
+            ),
+            layout="mul_ir",
+        )
+        scalar_indices = [
+            index
+            for (_, ir), block in zip(self.v_irreps, self.v_irreps.slices())
+            if ir == o3.Irrep("0e")
+            for index in range(block.start, block.stop)
+        ]
+        self.register_buffer(
+            "_scalar_indices",
+            torch.tensor(scalar_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.tp_norm = (
+            torch.nn.LayerNorm(channels, eps=layer_norm_eps)
+            if layer_norm
+            else torch.nn.Identity()
+        )
+        self.mlp = RadialMLP([2 * channels, 128, 128, 128, 1])
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        field_feats: torch.Tensor,
+        charges_0: torch.Tensor,
+        charges_induced: torch.Tensor,
+    ) -> torch.Tensor:
+        q_in = charges_induced + charges_0
+        v_in = field_feats
+        node_in = node_feats
+        if self._q_to_mul_ir is not None:
+            q_in = self._q_to_mul_ir(q_in)
+        if self._v_to_mul_ir is not None:
+            v_in = self._v_to_mul_ir(v_in)
+        if self._node_to_mul_ir is not None:
+            node_in = self._node_to_mul_ir(node_in)
+
+        mixed_feats = (
+            self.linear_up_q(q_in)
+            + self.linear_up_v(v_in)
+            + self.linear_up_node(node_in)
+        )
+        # Compute only 0e outputs: no full equivariant TP or channel-pair tensor
+        # is materialized just to discard its non-scalar components.
+        tp_invariants = self.tp_norm(self.self_tp(mixed_feats, mixed_feats))
+        scalar_feats = mixed_feats.index_select(-1, self._scalar_indices)
+        invar_feats = torch.cat([tp_invariants, scalar_feats], dim=-1)
+        return self.mlp(invar_feats).squeeze(-1)
+
+
+@compile_mode("script")
+class OneBodyNoFeildTPMLPFieldReadout(PostScfReadout):
+    """Read local electronic energy from charges and node features only.
+
+    LayerNorm is optional and acts only on the invariant TP output. It is off
+    by default because the magnitude of the electronic response carries useful
+    information, which per-atom normalization can suppress.
+    """
+
+    def _setup(
+        self,
+        layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+        **kwargs,
+    ) -> None:
+        _ = kwargs
+        channels = self.node_feats_irreps.count(o3.Irrep("0e"))
+        if channels == 0:
+            raise ValueError("OneBodyNoFeildTPMLPFieldReadout needs at least one 0e channel")
+        if layer_norm and channels == 1:
+            raise ValueError("LayerNorm needs at least two TP invariant channels")
+        if layer_norm_eps <= 0:
+            raise ValueError("layer_norm_eps must be positive")
+
+        # Every uvu path must have the output scalar block's multiplicity.
+        # Project to a common width even if the backbone's irreps have different
+        # multiplicities; retain its spatial irrep types.
+        self.v_irreps = o3.Irreps(
+            [(channels, ir) for _, ir in self.node_feats_irreps.sort()[0].simplify()]
+        )
+        invar_irreps = o3.Irreps(f"{channels}x0e")
+        self.linear_up_q = o3.Linear(self.charges_irreps, self.v_irreps, biases=True)
+        self.linear_up_node = o3.Linear(self.node_feats_irreps, self.v_irreps)
+
+        layout_str = (
+            self.cueq_config.layout_str
+            if self.cueq_config is not None and self.cueq_config.enabled
+            else "mul_ir"
+        )
+        # Keep all three embeddings and the TP in e3nn's mul_ir layout, avoiding
+        # a round trip back to the backend layout before the scalar readout.
+        self._q_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.charges_irreps,
+            source=layout_str,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self._node_to_mul_ir = TransposeIrrepsLayoutWrapper(
+            irreps=self.node_feats_irreps,
+            source=layout_str,
+            target="mul_ir",
+            cueq_config=self.cueq_config,
+        )
+        self.self_tp = SparseUvuTensorProduct(
+            irreps_in1=self.v_irreps,
+            irreps_in2=self.v_irreps,
+            irreps_out=invar_irreps,
+            instructions=instructions_for_sparse_tp(
+                self.v_irreps, self.v_irreps, invar_irreps
+            ),
+            layout="mul_ir",
+        )
+        scalar_indices = [
+            index
+            for (_, ir), block in zip(self.v_irreps, self.v_irreps.slices())
+            if ir == o3.Irrep("0e")
+            for index in range(block.start, block.stop)
+        ]
+        self.register_buffer(
+            "_scalar_indices",
+            torch.tensor(scalar_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.tp_norm = (
+            torch.nn.LayerNorm(channels, eps=layer_norm_eps)
+            if layer_norm
+            else torch.nn.Identity()
+        )
+        self.mlp = RadialMLP([2 * channels, 128, 128, 128, 1])
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        field_feats: torch.Tensor,
+        charges_0: torch.Tensor,
+        charges_induced: torch.Tensor,
+    ) -> torch.Tensor:
+        q_in = charges_induced + charges_0
+        node_in = node_feats
+        if self._q_to_mul_ir is not None:
+            q_in = self._q_to_mul_ir(q_in)
+        if self._node_to_mul_ir is not None:
+            node_in = self._node_to_mul_ir(node_in)
+
+        mixed_feats = self.linear_up_q(q_in) + self.linear_up_node(node_in)
+        # Compute only 0e outputs: no full equivariant TP or channel-pair tensor
+        # is materialized just to discard its non-scalar components.
+        tp_invariants = self.tp_norm(self.self_tp(mixed_feats, mixed_feats))
+        scalar_feats = mixed_feats.index_select(-1, self._scalar_indices)
+        invar_feats = torch.cat([tp_invariants, scalar_feats], dim=-1)
+        return self.mlp(invar_feats).squeeze(-1)
+
+
 # Registries used by config files that pass strings
 field_update_blocks = {
     "AgnosticEmbeddedOneBodyVariableUpdate": AgnosticEmbeddedOneBodyVariableUpdate,
+    "PairwiseGatedMultipoleUpdate": PairwiseGatedMultipoleUpdate,
+    "MessagePassingMultipoleUpdate": MessagePassingMultipoleUpdate,
 }
 
 field_readout_blocks = {
     "OneBodyMLPFieldReadout": OneBodyMLPFieldReadout,
+    "OneBodyTPMLPFieldReadout": OneBodyTPMLPFieldReadout,
+    "OneBodyNoFeildTPMLPFieldReadout": OneBodyNoFeildTPMLPFieldReadout,
 }

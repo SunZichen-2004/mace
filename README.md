@@ -8,6 +8,12 @@
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.14103332-blue.svg)](https://doi.org/10.5281/zenodo.14103332)
 [![Coverage](https://coveralls.io/repos/github/ACEsuit/mace/badge.svg?branch=develop)](https://coveralls.io/github/ACEsuit/mace/?branch=develop)
 
+## MACE-POLAR-2 branch
+
+PolarMACE response models and electrostatic ML/MM support are developed on this
+branch. The [BMS25 ML/MM checkpoint guide](docs/mace_polar_2_mlmm.md) describes
+the exact five-width Pairwise step-14500 model and links its separate model release.
+
 ## Project status
 
 **MACE is being rewritten toward v1.0.** The rewrite happens in the open on the
@@ -128,6 +134,25 @@ mace_run_train \
 ```
 
 To give a specific validation set, use the argument `--valid_file`. To set a larger batch size for evaluating the validation set, specify `--valid_batch_size`.
+
+Select `--optimizer=muon` to use native PyTorch Muon for the two-dimensional
+radial MLP weights (`interactions.*.conv_tp_weights.*.weight`) and AdamW for
+all remaining parameters, including equivariant and polar weights. This requires
+PyTorch >= 2.9; no additional optimizer package is needed. For example, add:
+
+```sh
+--optimizer=muon --lr=0.001 --muon_lr=0.01 --muon_momentum=0.95
+```
+
+`--lr` controls AdamW and is also Muon's default when `--muon_lr` is omitted.
+Both retain the existing `--lr_params_factors` and weight-decay groups.
+`--muon_ns_steps` defaults to 5, and `--muon_adjust_lr_fn` defaults to `original`
+(also supports `match_rms_adamw`). Existing schedulers, EMA, stage two and
+`--restart_latest` use the same training interfaces. Checkpoints store both
+optimizers' state; restart a Muon run with the same optimizer and model layout.
+This follows the hybrid approach of [Muon-MACE](https://github.com/ShiQiaoL/Muon-MACE),
+using PyTorch's implementation rather than its pinned external backend.
+The example learning rates are starting points, not a measured convergence gain.
 
 To control the model's size, you need to change `--hidden_irreps`. For most applications, the recommended default model size is `--hidden_irreps='256x0e'` (meaning 256 invariant messages) or `--hidden_irreps='128x0e + 128x1o'`. If the model is not accurate enough, you can include higher order features, e.g., `128x0e + 128x1o + 128x2e`, or increase the number of channels to `256`. It is also possible to specify the model using the     `--num_channels=128` and `--max_L=1`keys.
 
@@ -326,6 +351,24 @@ For usage, outputs, and training/finetuning details, see the PolarMACE guide:
 
 - https://mace-docs.readthedocs.io/en/latest/guide/polar_mace.html
 
+`--potential_feature_mode=charge_spin --spin_field_alpha=0.5` uses
+`Coulomb(rho_up + rho_down) / 2` and
+`[erfc(alpha*r)/r * (rho_up - rho_down)] / 2` as the two field channels.
+The fixed alpha is in inverse Angstrom. Both channels retain the configured
+receiver Gaussian widths, field normalization, and `field_si` setting. The
+external electric field enters the charge channel only. The default
+`alpha_beta` mode retains separate Coulomb fields. The former
+`spin_summed_field`/`only_charge` mode has been removed.
+
+The screened Gaussian integral is evaluated as the difference of Coulomb
+integrals with source variances `sigma_source**2` and
+`sigma_source**2 + 1/(2*alpha**2)`; source multipole moments and receiver
+normalization are preserved. For 3D periodic systems the screened Fourier
+factor is `(1 - exp(-k**2/(4*alpha**2))) / k**2`, with limit
+`1/(4*alpha**2)` at zero. Screened spin features support open molecular
+batches and fully 3D periodic batches; partial PBC and mixed open/periodic
+batches are not supported. Physical Coulomb energy remains unchanged.
+
 ### Finetuning foundation models
 
 To finetune one of the mace-mp-0 foundation model, you can use the `mace_run_train` script with the extra argument `--foundation_model=model_type`. For example to finetune the small model on a new dataset, you can use:
@@ -487,3 +530,150 @@ For bugs or feature requests, please use [GitHub Issues](https://github.com/ACEs
 ## License
 
 The MACE code is published and distributed under the [MIT License](MIT.md). (Note that some of the models linked above come with different licenses).
+
+### Training with fragment interaction energies
+
+Opt in with `--interaction_energy_training=True --interaction_energy_weight=100`.
+The model and saved inference interface are unchanged. For each complex the loss adds
+`weight * mean(((E_model(complex) - sum(E_model(fragment)) - E_ref_interaction) / N_complex)**2)`.
+All energies come from the current model, with gradients through every fragment;
+`N_complex` counts the original complex atoms, excluding auxiliary copies.
+
+This initial path supports nonperiodic Configuration HDF5 with zero external field
+and Fermi level. Each complex requires `metadata/molecule_group_index` (disjoint,
+nonempty groups 0..K-1 covering every atom), `molecule_charges`,
+`molecule_multiplicities`, and the `metadata` attribute `interaction_energy` in eV.
+Optional isolated energies/forces and molecular multipoles are retained for diagnostics.
+The synthetic-data HDF5 files already contain this metadata. Ordinary source frames
+without fragment metadata retain their usual energy/force supervision. Generated
+auxiliary fragment graphs do not add ordinary loss terms or dilute source losses.
+
+`--interaction_energy_keep_total_loss=False` (default) masks ordinary complex E/F
+losses; set it to `True` to add interaction supervision to ordinary complex E/F
+training. This flag does not enable charge-group constraints. Use `weighted` or
+`energy_forces_dipole_quadrupole` / `energy_forces_multipole_spin` losses. The current
+masking applies to energy and force terms; multipole supervision can be configured
+separately. Batch sizes and distributed sampling count complete source samples,
+never individual members of a complex/fragment group. Runtime metrics include
+`loss_interaction_energy`, `mae_interaction_energy`, `rmse_interaction_energy`, and
+the corresponding errors per complex atom. The feature is off by default.
+
+### Fragment total charge and spin supervision
+
+Use `--fragment_charge_spin_training=True --fragment_charge_weight=1000
+--fragment_spin_weight=1000` to add losses on the sums of the model's final atomic
+`charges` and `spins` within each fragment. Both terms are mean squared errors
+per labeled fragment, with no atom-count division. All existing total-energy and
+force loss terms remain active. This supervises predictions; it does not apply
+hard fragment normalization or change the inference model.
+
+Configuration HDF5 metadata must contain `molecule_group_index` (disjoint groups
+0..K-1 covering the atoms), `molecule_charges`, and either `molecule_spins`
+(signed 2Sz) or `molecule_multiplicities` (converted to 2Sz=multiplicity-1).
+For oppositely aligned open-shell fragments, provide signed `molecule_spins`.
+Targets must sum to the system's charge and 2Sz. Frames without fragment metadata
+retain ordinary E/F supervision. No auxiliary graphs or additional model forward
+passes are created. This mode is off by default and currently uses HDF5 input;
+it is separate from `--interaction_energy_training`. Training and validation
+report `loss_fragment_charge`, `loss_fragment_spin` and fragment MAE/RMSE values.
+
+Interaction-force supervision is enabled with `--interaction_force_weight=1000`
+under `--interaction_energy_training=True`; its default weight is 0 (off).
+Predictions use `F_complex[i] - F_isolated_fragment[mapped_i]`, with gradients
+through both model force branches and an explicit original-to-fragment atom map.
+The force L2 is the mean squared Cartesian-component error over labeled atoms,
+without the extra complex-atom division used for interaction energy. Labels come
+from `metadata/interaction_forces`, or reference full forces minus
+`metadata/isolated_DFT_forces`; missing labels fail explicitly. Isolated-source
+ordinary E/F supervision is retained. Logs include `loss_interaction_forces`
+and `mae_interaction_forces` / `rmse_interaction_forces` in eV/Angstrom.
+
+
+### PolarMACE electrostatic ML/MM
+
+Pass `MM_coordinate` (M by 3, Angstrom) and `MM_charges` (M, elementary charge)
+to `PolarMACE.forward`, either as keyword arguments or entries in the data
+dictionary. For multiple QM graphs, also provide `MM_batch` (M graph IDs).
+MM particles are external electrostatic sources and do not enter the MACE
+short-range graph. Model parameters and the existing field readout are preserved.
+
+```python
+result = model(data, MM_coordinate=MM_coordinate, MM_charges=MM_charges,
+               MM_batch=MM_batch, MM_method="PME")
+energy = result["energy"]       # embedded QM energy, eV
+forces = result["forces"]      # QM forces, eV/Angstrom
+MM_forces = result["MM_forces"]  # MM back-reaction forces, eV/Angstrom
+```
+
+The MM potential is projected onto the existing Gaussian feature basis and
+split equally between the two spin channels. Its projection onto the final ML
+density basis gives the explicit cross energy, `sum(c_QM * v_MM)`, without a
+factor of one half. MM/MM and QM/MM Lennard-Jones energies remain the classical
+engine's responsibility. Both force arrays differentiate the same total embedded
+energy, including the model's polarization response.
+
+`MM_method="direct"` is the default. For fully periodic cells, `"PME"` uses
+particle-mesh spreading and FFTs for the MM source structure factors in both
+features and cross energy; install `torch-pme>=0.5.0` (or the `mlmm` extra).
+The implementation reuses the PME helper from OpenMM-ML PR 169's graph-longrange
+dependency; its revision is recorded in `mace/modules/mm_pme.py`. The reciprocal
+vectors, zero-mode convention and ML basis are shared with the original model.
+`MM_charge_width=0.0` represents point charges; a positive value represents
+Gaussian MM charges of that width in Angstrom. Nonperiodic inputs use the
+analytical Gaussian-target/point-source Coulomb kernel. Slab boundaries and
+embedded stress/Hessian calculations are currently unsupported.
+
+BMS25 training uses the original, unpacked `.h5` shards with
+`mace/cli/run_train_mm.py`. First prepare persistent split indices using the
+[AMP-BMS paper's](https://doi.org/10.1021/jacs.6c00217) documented rule: reserve
+oligopeptides and miniproteins for testing, randomly select 1% of the remaining
+eligible conformations for validation, and require the largest absolute QM
+gradient component to be below 2000 kJ/mol/Angstrom. Author frame indices and
+the original split seed are not supplied by the public repository; the command
+below records a reproducible seed-1 realization of the published rule.
+Training conformations are shuffled globally without replacement each epoch,
+then partitioned among workers. Validation and test indices remain fixed.
+The loader converts kJ/mol to eV and negates stored gradients for force labels.
+The loss is per-QM-atom energy L1 plus independently normalized QM and MM force
+component MSEs. QM forces retain the existing `forces` name; MM labels and
+predictions use `MM_forces`. The existing OMol training entry point is unchanged.
+
+```bash
+python mace/cli/prepare_bms.py --directory=/path/to/BMS25 \
+  --output=/path/to/split --seed=1
+python mace/cli/run_train_mm.py --train_file=/path/to/BMS25 \
+  --work_dir=/path/to/run --foundation_model=polar-1-m \
+  --split_manifest=/path/to/split/manifest.json --fukui_regularisation=0.1 \
+  --batch_size=512 --lr=0.01 --enable_cueq=True --cueq_conv_fusion=False \
+  --max_edges=450000 --max_pairs=42000000 --num_workers=4 \
+  --energy_weight=10 --forces_weight=10 --MM_forces_weight=10
+```
+
+Parameters and coordinates use FP32 without autocast. These batches may mix
+molecules; the AMP paper instead used up to ten conformations of one molecule
+per batch for its relative-energy objective. The loss above uses per-atom
+absolute energies and the requested independent QM/MM force MSEs.
+
+`mace/cli/run_train_mm_ddp.py` accepts the same split manifest and an
+`--initial_model` created by constructing a new `PolarMACE` from its architecture
+config. It supports a random initialization with fitted E0s and
+`recompute_field_after_scf=True`. Launch with `torchrun --nproc_per_node=8`.
+`--batch_size` is per rank: global batches are partitioned without duplicated
+or dropped conformations, and graph/pair budgets split each rank's batch into
+microbatches. Gradient accumulation normalizes each energy/QM-force/MM-force
+term by its global count before DDP averages gradients. Rolling checkpoints
+include the epoch cursor, optimizer, and per-rank RNG states. Full validation
+at each epoch saves `best.model`; intermediate validation uses one global batch.
+
+This fine-tunes the pretrained model without changing its learned modules or
+enabling `recompute_field_after_scf`. Rolling checkpoints include optimizer
+state; the final `.model` contains the schedule-free optimizer's evaluation
+weights. The BMS25 reference level differs from OMol25, so this is BMS25
+fine-tuning rather than joint supervision at a single reference level.
+With cuEq enabled, conversion preserves the checkpoint's modules, including
+the absence of `tp_mix` in older models. Optional edge and pair budgets reduce
+the number of structures in batches containing large proteins; every valid
+sample is retained. Pair counts include QM/MM pairs and within-QM pairs.
+
+Records whose MM-gradient shape does not match the MM coordinates are warned
+about and skipped explicitly; no missing MM force labels are fabricated.

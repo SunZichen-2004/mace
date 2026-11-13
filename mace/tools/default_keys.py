@@ -17,6 +17,8 @@ class DefaultKeys(Enum):
     CHARGES = "REF_charges"
     TOTAL_CHARGE = "total_charge"
     TOTAL_SPIN = "total_spin"
+    MBIS_CHARGE_COEFFICIENTS = "mbis_charge_coefficients"
+    MBIS_SPIN_COEFFICIENTS = "mbis_spin_coefficients"
     ELEC_TEMP = "elec_temp"
     MAGMOM = "REF_magmom"
     MAGFORCES = "REF_magforces"

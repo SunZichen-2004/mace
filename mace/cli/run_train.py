@@ -139,6 +139,30 @@ def run(args) -> None:
     """
     This script runs the training/fine tuning for mace
     """
+    interaction_training = getattr(args, "interaction_energy_training", False)
+    interaction_force_weight = getattr(args, "interaction_force_weight", 0.0)
+    if not 0 <= interaction_force_weight < float("inf"):
+        raise ValueError("interaction_force_weight must be finite and nonnegative")
+    if interaction_force_weight and not interaction_training:
+        raise ValueError("interaction_force_weight requires interaction_energy_training=True")
+    loader_class = torch_geometric.dataloader.DataLoader
+    if interaction_training:
+        from mace.data.interaction_dataset import (
+            InteractionDataLoader, wrap_interaction_dataset,
+        )
+        if args.interaction_energy_weight < 0:
+            raise ValueError("interaction_energy_weight must be nonnegative")
+        loader_class = InteractionDataLoader
+    fragment_training = getattr(args, "fragment_charge_spin_training", False)
+    if fragment_training:
+        from mace.data.fragment_dataset import FragmentDataLoader, wrap_fragment_dataset
+
+        if interaction_training:
+            raise ValueError("Fragment charge/spin and interaction-energy modes currently require separate runs")
+        for weight in (args.fragment_charge_weight, args.fragment_spin_weight):
+            if not 0 <= weight < float("inf"):
+                raise ValueError("Fragment loss weights must be finite and nonnegative")
+        loader_class = FragmentDataLoader
     tag = tools.get_tag(name=args.name, seed=args.seed)
     args, input_log_messages = tools.check_args(args)
 
@@ -315,7 +339,7 @@ def run(args) -> None:
                 "Using multiheads finetuning mode, setting learning rate to 0.0001 and EMA to True"
             )
         if hasattr(model_foundation, "heads"):
-            if len(model_foundation.heads) > 1:
+            if len(model_foundation.heads) > 1 and args.loss != "polar2":
                 logging.info(
                     f"Selecting the head {args.foundation_head} as foundation head."
                 )
@@ -692,6 +716,7 @@ def run(args) -> None:
             in (
                 "energy_forces_dipole_quadrupole",
                 "energy_forces_multipole_spin",
+                "polar2",
             )
         ):
             args.compute_dipole = True
@@ -813,6 +838,23 @@ def run(args) -> None:
         if not valid_sets[head_config.head_name]:
             raise ValueError(f"No valid datasets found for head {head_config.head_name}, please provide a valid_file or a valid_fraction")
 
+        if interaction_training:
+            keep_total = args.interaction_energy_keep_total_loss
+            train_sets[head_config.head_name] = wrap_interaction_dataset(
+                train_sets[head_config.head_name], keep_total, interaction_force_weight > 0)
+            valid_sets[head_config.head_name] = wrap_interaction_dataset(
+                valid_sets[head_config.head_name], keep_total, interaction_force_weight > 0)
+            logging.info(
+                "Interaction training: weight=%g, per-complex-atom L2, keep_total_loss=%s; batch_size counts source samples",
+                args.interaction_energy_weight, keep_total)
+
+        if fragment_training:
+            train_sets[head_config.head_name] = wrap_fragment_dataset(train_sets[head_config.head_name])
+            valid_sets[head_config.head_name] = wrap_fragment_dataset(valid_sets[head_config.head_name])
+            logging.info(
+                "Fragment total charge/spin training: charge_weight=%g, spin_weight=%g; total MSE, no atom-count division; spin target=2Sz",
+                args.fragment_charge_weight, args.fragment_spin_weight)
+
         # Create data loader for this head
         if isinstance(train_sets[head_config.head_name], list):
             dataset_size = len(train_sets[head_config.head_name])
@@ -820,7 +862,7 @@ def run(args) -> None:
             dataset_size = len(train_sets[head_config.head_name])
         logging.info(f"Head '{head_config.head_name}' training dataset size: {dataset_size}")
 
-        train_loader_head = torch_geometric.dataloader.DataLoader(
+        train_loader_head = loader_class(
             dataset=train_sets[head_config.head_name],
             batch_size=args.batch_size,
             shuffle=True,
@@ -855,7 +897,7 @@ def run(args) -> None:
             )
             valid_samplers[head] = valid_sampler
 
-    train_loader = torch_geometric.dataloader.DataLoader(
+    train_loader = loader_class(
         dataset=train_set,
         batch_size=args.batch_size,
         sampler=train_sampler,
@@ -865,6 +907,14 @@ def run(args) -> None:
         num_workers=args.num_workers,
         generator=torch.Generator().manual_seed(args.seed),
     )
+
+    if args.loss == "polar2":
+        from mace.data.polar2_dataset import Polar2BatchSampler, Polar2DataLoader
+        train_sampler = Polar2BatchSampler(train_set, args.polar2_steps_per_epoch,
+                                          rank if args.distributed else 0,
+                                          world_size if args.distributed else 1, args.seed)
+        train_loader = Polar2DataLoader(train_set, batch_sampler=train_sampler,
+                                       num_workers=args.num_workers, pin_memory=args.pin_memory)
 
     if len(train_loader) == 0:
         # Two ways to end up here, and they need different advice.
@@ -901,7 +951,7 @@ def run(args) -> None:
     if not isinstance(valid_sets, dict):
         valid_sets = {"Default": valid_sets}
     for head, valid_set in valid_sets.items():
-        valid_loaders[head] = torch_geometric.dataloader.DataLoader(
+        valid_loaders[head] = loader_class(
             dataset=valid_set,
             batch_size=args.valid_batch_size,
             sampler=valid_samplers[head] if args.distributed else None,
@@ -912,12 +962,46 @@ def run(args) -> None:
             generator=torch.Generator().manual_seed(args.seed),
         )
 
+    if args.loss == "polar2":
+        for head, dataset in valid_sets.items():
+            sampler = Polar2BatchSampler(dataset, rank=rank if args.distributed else 0,
+                                        world_size=world_size if args.distributed else 1,
+                                        seed=args.seed, validation=True)
+            valid_loaders[head] = Polar2DataLoader(dataset, batch_sampler=sampler,
+                                                  num_workers=args.num_workers,
+                                                  pin_memory=args.pin_memory,
+                                                  persistent_workers=False)
+        for head_config in head_configs:
+            # Final training-set evaluation is capped by explicit descriptors
+            # instead of materializing an unbounded multi-million-frame pass.
+            head_config.train_loader = valid_loaders[head_config.head_name]
+        if os.environ.get("POLAR2_VALIDATION_BY_SOURCE") == "1":
+            from mace.data.polar2_dataset import dataset_leaves
+            valid_loaders = {}
+            for head, dataset in valid_sets.items():
+                for leaf, _ in dataset_leaves(dataset):
+                    sampler = Polar2BatchSampler(leaf, rank=rank if args.distributed else 0,
+                                                world_size=world_size if args.distributed else 1,
+                                                seed=args.seed, validation=True)
+                    valid_loaders[head + "/" + leaf.name] = Polar2DataLoader(
+                        leaf, batch_sampler=sampler, num_workers=args.num_workers,
+                        pin_memory=args.pin_memory, persistent_workers=False)
+
+    if getattr(args, "gaussian_weighted_multipole_training", False):
+        args.compute_spin_multipoles = True
     loss_fn = get_loss_fn(args, dipole_only, args.compute_dipole)
     args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
 
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
     model.to(device)
+    if getattr(args, "gaussian_weighted_multipole_training", False):
+        if getattr(model, "atomic_multipoles_max_l", None) != 1:
+            raise ValueError("Gaussian MBIS supervision requires an l=0,1 PolarMACE model")
+        native_tau = float(model.atomic_multipoles_smearing_width)
+        if abs(native_tau - args.gaussian_tau) > 1e-12:
+            raise ValueError(f"Gaussian density tau={args.gaussian_tau} must match model native tau={native_tau}")
+        logging.info("Gaussian MBIS density tau verified against native model: %.6f Angstrom", native_tau)
 
     if args.lora:
         lora_rank = args.lora_rank
@@ -1122,7 +1206,11 @@ def run(args) -> None:
             device_ids = [xpu_device_index(local_rank)]
         else:
             device_ids = None
-        distributed_model = DDP(model, device_ids=device_ids)
+        # PolarMACE can leave field/electron modules unused when
+        # add_local_electron_energy / add_electrostatic_energy are False.
+        distributed_model = DDP(
+            model, device_ids=device_ids, find_unused_parameters=True
+        )
     else:
         distributed_model = None
 
@@ -1256,7 +1344,12 @@ def run(args) -> None:
                 drop_last = test_set.drop_last
             except AttributeError as e:  # pylint: disable=W0612
                 drop_last = False
-            test_loader = torch_geometric.dataloader.DataLoader(
+            if interaction_training:
+                test_set = wrap_interaction_dataset(
+                    test_set, args.interaction_energy_keep_total_loss, interaction_force_weight > 0)
+            if fragment_training:
+                test_set = wrap_fragment_dataset(test_set)
+            test_loader = loader_class(
                 test_set,
                 batch_size=args.valid_batch_size,
                 shuffle=(test_sampler is None),
@@ -1289,7 +1382,9 @@ def run(args) -> None:
                 device_ids = [xpu_device_index(local_rank)]
             else:
                 device_ids = None
-            distributed_model = DDP(model, device_ids=device_ids)
+            distributed_model = DDP(
+                model, device_ids=device_ids, find_unused_parameters=True
+            )
         model_to_evaluate = model if not args.distributed else distributed_model
         if swa_eval:
             logging.info(f"Loaded Stage two model from epoch {epoch} for evaluation")

@@ -57,10 +57,12 @@ def convert_polar_model(model, pbc_handling: str = "auto"):
     # still provide the concrete graph_longrange type contract.
     if not any(cls.__name__ == "PolarMACE" for cls in type(model).__mro__):
         raise TypeError("Expected a PolarMACE whole model, not a checkpoint state dict")
-    blocks = (
+    blocks = [
         (model.electric_potential_descriptor, GTOElectrostaticFeatures),
         (model.coulomb_energy, GTOElectrostaticEnergy),
-    )
+    ]
+    if getattr(model, "spin_potential_descriptor", None) is not None:
+        blocks.append((model.spin_potential_descriptor, GTOElectrostaticFeatures))
     repairs = []
     for block, expected_type in blocks:
         if not isinstance(block, expected_type) or not hasattr(

@@ -189,6 +189,16 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument(
+        "--readout_cls",
+        help="readout block used for the last layer's energy readout",
+        type=str,
+        default="NonLinearReadoutBlock",
+        choices=[
+            "NonLinearReadoutBlock",
+            "NonLinearBiasReadoutBlock",
+        ],
+    )
+    parser.add_argument(
         "--use_last_readout_only",
         help="use only the last readout for the final output",
         type=str2bool,
@@ -369,6 +379,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument(
+        "--add_electrostatic_energy",
+        help=(
+            "add Coulomb electrostatic energy (and F·μ) to PolarMACE total "
+            "energy; set False to keep only the MACE backbone energy"
+        ),
+        type=str2bool,
+        default=True,
+    )
+    parser.add_argument(
         "--quadrupole_feature_corrections",
         help="enable quadrupole feature corrections in PolarMACE",
         type=str2bool,
@@ -410,14 +429,36 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=False,
     )
+    parser.add_argument("--gaussian_weighted_multipole_training", type=str2bool, default=False,
+                        help="Online Gaussian-window supervision from intrinsic MBIS charge/spin multipoles")
+    parser.add_argument("--gaussian_sigma", type=float, default=6.0, help="Unnormalized measurement-window sigma in Angstrom")
+    parser.add_argument("--gaussian_tau", type=float, default=1.5, help="CG density GTO width in Angstrom; must match model native width")
+    parser.add_argument("--gaussian_multipole_weight", type=float, default=100.0,
+                        help="Default weight of each atom/component-mean Gaussian L2 term")
+    for component in ("charge", "dipole", "spin", "spin_dipole"):
+        parser.add_argument("--gaussian_" + component + "_weight", type=float, default=None,
+                            help="Optional override of gaussian_multipole_weight for " + component)
+    parser.add_argument("--mbis_charge_coefficients_key", default="mbis_charge_coefficients",
+                        help="ASE per-atom intrinsic MBIS charge coefficients (q,mu_y,mu_z,mu_x)")
+    parser.add_argument("--mbis_spin_coefficients_key", default="mbis_spin_coefficients",
+                        help="ASE per-atom intrinsic MBIS spin coefficients (s,mu_y,mu_z,mu_x)")
     parser.add_argument(
-        "--spin_summed_field",
-        help=(
-            "PolarMACE: feed the averaged alpha/beta field features into both "
-            "channels instead of the separate spin-resolved fields"
-        ),
+        "--potential_feature_mode",
+        choices=("alpha_beta", "charge_spin"),
+        default="alpha_beta",
+        help="PolarMACE: alpha/beta Coulomb fields or Coulomb charge + short-range spin fields",
+    )
+    parser.add_argument(
+        "--spin_field_alpha",
+        type=float,
+        default=0.5,
+        help="PolarMACE charge_spin: fixed erfc(alpha*r)/r screening in inverse Angstrom",
+    )
+    parser.add_argument(
+        "--recompute_field_after_scf",
         type=str2bool,
         default=False,
+        help="PolarMACE: recompute local-energy field from the final SCF charges",
     )
     parser.add_argument(
         "--fukui_regularisation",
@@ -884,8 +925,11 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "energy_forces_dipole_quadrupole",
             "energy_forces_multipole_spin",
             "l1l2energyforces",
+            "polar2",
         ],
     )
+    parser.add_argument("--polar2_steps_per_epoch", type=int, default=1000, help="POLAR-2 updates per virtual epoch; -1 traverses every active training source")
+    parser.add_argument("--MM_forces_weight", type=float, default=10.0)
     parser.add_argument(
         "--forces_weight", help="weight of forces loss", type=float, default=100.0
     )
@@ -910,6 +954,34 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=100.0,
         dest="swa_magforces_weight",
+    )
+    parser.add_argument(
+        "--fragment_charge_spin_training", type=str2bool, default=False,
+        help="Add supervision of fragment sums of final atomic charges and signed 2Sz; default off",
+    )
+    parser.add_argument(
+        "--fragment_charge_weight", type=float, default=1000.0,
+        help="Weight of fragment total charge MSE (no atom-count normalization)",
+    )
+    parser.add_argument(
+        "--fragment_spin_weight", type=float, default=1000.0,
+        help="Weight of fragment total signed spin MSE, target multiplicity-1 or molecule_spins",
+    )
+    parser.add_argument(
+        "--interaction_energy_training", type=str2bool, default=False,
+        help="Train E(complex)-sum(E(fragment)) from HDF5 fragment metadata; default off",
+    )
+    parser.add_argument(
+        "--interaction_force_weight", type=float, default=0.0,
+        help="Interaction-force component MSE weight; 0 disables; requires interaction_energy_training",
+    )
+    parser.add_argument(
+        "--interaction_energy_weight", type=float, default=100.0,
+        help="Weight of mean squared interaction-energy error divided by total complex atom count",
+    )
+    parser.add_argument(
+        "--interaction_energy_keep_total_loss", type=str2bool, default=False,
+        help="Also retain ordinary complex energy/force losses; isolated-source losses are always retained",
     )
     parser.add_argument(
         "--energy_weight", help="weight of energy loss", type=float, default=1.0
@@ -1028,7 +1100,25 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Optimizer for parameter optimization",
         type=str,
         default="adam",
-        choices=["adam", "adamw", "schedulefree"],
+        choices=["adam", "adamw", "schedulefree", "muon"],
+    )
+    parser.add_argument(
+        "--muon_lr",
+        help="Base LR for Muon radial MLP matrices (defaults to --lr); other parameters use AdamW at --lr. Both respect --lr_params_factors",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--muon_momentum", help="Muon momentum", type=float, default=0.95
+    )
+    parser.add_argument(
+        "--muon_ns_steps", help="Muon Newton-Schulz iterations", type=int, default=5
+    )
+    parser.add_argument(
+        "--muon_adjust_lr_fn",
+        help="Muon matrix-shape LR scaling",
+        choices=["original", "match_rms_adamw"],
+        default="original",
     )
     parser.add_argument(
         "--beta",

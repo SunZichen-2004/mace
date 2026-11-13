@@ -5,6 +5,8 @@ from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import numpy as np
 import torch
+
+from .polar2_response import physical_polarizability
 from e3nn import o3
 from e3nn.io import CartesianTensor
 from e3nn.o3._reduce import ReducedTensorProducts
@@ -18,6 +20,8 @@ try:
         gto_basis_kspace_cutoff,
     )
     from graph_longrange.kspace import compute_k_vectors_flat
+
+    from mace.modules.screened_field import ScreenedGTOElectrostaticFeatures
 
     GRAPH_LONGRANGE_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -681,6 +685,7 @@ class PolarMACE(ScaleShiftMACE):
         field_si: bool = False,
         include_electrostatic_self_interaction: bool = False,
         add_local_electron_energy: bool = False,
+        add_electrostatic_energy: bool = True,
         quadrupole_feature_corrections: bool = False,
         return_electrostatic_potentials: bool = False,
         field_feature_norms: Optional[List[float]] = None,
@@ -694,7 +699,9 @@ class PolarMACE(ScaleShiftMACE):
         compute_dipole_from_electric_field: bool = False,
         compute_polarizability: bool = False,
         compute_spin_multipoles: bool = False,
-        spin_summed_field: bool = False,
+        potential_feature_mode: str = "alpha_beta",
+        spin_field_alpha: float = 0.5,
+        recompute_field_after_scf: bool = False,
         **kwargs,
     ):
         if not GRAPH_LONGRANGE_AVAILABLE:
@@ -758,13 +765,18 @@ class PolarMACE(ScaleShiftMACE):
         )
         self.atomic_multipoles_smearing_width = float(atomic_multipoles_smearing_width)
         self.add_local_electron_energy = add_local_electron_energy
+        self.add_electrostatic_energy = add_electrostatic_energy
         self.quadrupole_feature_corrections = quadrupole_feature_corrections
         self.field_si = field_si
         self.keep_last_layer_irreps = True
         self.compute_dipole_from_electric_field = compute_dipole_from_electric_field
         self.compute_polarizability = compute_polarizability
         self.compute_spin_multipoles = compute_spin_multipoles
-        self.spin_summed_field = bool(spin_summed_field)
+        if potential_feature_mode not in ("alpha_beta", "charge_spin"):
+            raise ValueError("Unknown potential_feature_mode: " + potential_feature_mode)
+        self.potential_feature_mode = potential_feature_mode
+        self.spin_field_alpha = float(spin_field_alpha)
+        self.recompute_field_after_scf = bool(recompute_field_after_scf)
 
         # k-space cutoff heuristic
         kspace_cutoff = kspace_cutoff_factor * gto_basis_kspace_cutoff(
@@ -844,6 +856,20 @@ class PolarMACE(ScaleShiftMACE):
             pbc_handling=pbc_handling,
             realspace_method=realspace_method,
         )
+        self.spin_potential_descriptor = None
+        if potential_feature_mode == "charge_spin":
+            self.spin_potential_descriptor = ScreenedGTOElectrostaticFeatures(
+                screening_alpha=self.spin_field_alpha,
+                density_max_l=atomic_multipoles_max_l,
+                density_smearing_width=atomic_multipoles_smearing_width,
+                feature_max_l=field_feature_max_l,
+                feature_smearing_widths=list(field_feature_widths),
+                kspace_cutoff=kspace_cutoff,
+                include_self_interaction=field_si,
+                integral_normalization="receiver",
+                pbc_handling=pbc_handling,
+                realspace_method=realspace_method,
+            )
         field_layout_target = (
             cueq_config.layout_str
             if (cueq_config is not None and cueq_config.enabled)
@@ -1034,6 +1060,72 @@ class PolarMACE(ScaleShiftMACE):
         norm = torch.where(norm == 0, torch.ones_like(norm), norm)
         return fukui_sources / norm
 
+    def _constrain_charge_groups(
+        self, spin_charge_density: torch.Tensor, data: dict
+    ) -> torch.Tensor:
+        """Uniform projection of monopoles onto disjoint charge/spin groups.
+
+        Explicit group tensors are supplied by the ASE calculator. Without them,
+        retain the optional fixed-size neutral-cell diagnostic, opt-in via
+        ``charge_constraint_group_size`` on the loaded model.
+        It projects the monopole in each spin channel to its share of the graph
+        charge using the minimum-norm uniform correction within each group.
+        Groups are consecutive atoms and must tile a single graph exactly.
+        """
+        if "constraint_group" in data:
+            # Group projection replaces global monopole normalisation. Applying
+            # both would retain a dependence on disconnected fragments' errors.
+            monopoles = spin_charge_density[:, :, 0]
+            charge = safe_double(monopoles.sum(dim=1))
+            spin = safe_double(monopoles[:, 0] - monopoles[:, 1])
+            groups = data["constraint_group"]
+            targets = data["constraint_group_charges"]
+            count = scatter_sum(
+                torch.ones_like(charge), groups, dim=0, dim_size=targets.numel()
+            )
+            charge_sum = scatter_sum(charge, groups, dim=0, dim_size=targets.numel())
+            dq = ((targets - charge_sum) / count)[groups]
+            if "constraint_group_spins" in data:
+                spin_sum = scatter_sum(spin, groups, dim=0, dim_size=targets.numel())
+                dm = ((data["constraint_group_spins"] - spin_sum) / count)[groups]
+            else:
+                # Charge-only groups leave spin free to redistribute, subject
+                # to the original total_spin - 1 target for each graph.
+                batch = data["batch"]
+                num_graphs = data["total_spin"].numel()
+                spin_sum = scatter_sum(spin, batch, dim=0, dim_size=num_graphs)
+                spin_count = scatter_sum(
+                    torch.ones_like(spin), batch, dim=0, dim_size=num_graphs
+                )
+                dm = ((data["total_spin"] - 1 - spin_sum) / spin_count)[batch]
+            correction = 0.5 * torch.stack((dq + dm, dq - dm), dim=1)
+            constrained = spin_charge_density.clone()
+            constrained[:, :, 0] = monopoles + correction.to(monopoles.dtype)
+            return constrained
+
+        group_size = getattr(self, "charge_constraint_group_size", None)
+        if group_size is None:
+            return spin_charge_density
+        num_atoms = spin_charge_density.shape[0]
+        if len(data["total_charge"]) != 1 or num_atoms % group_size:
+            raise ValueError("charge groups require one graph tiled by group_size atoms")
+        num_groups = num_atoms // group_size
+        groups = torch.arange(num_atoms, device=spin_charge_density.device) // group_size
+        total_charge = data["total_charge"][0]
+        total_spin = data["total_spin"][0]
+        target = torch.stack(
+            ((total_charge + total_spin - 1) / (2 * num_groups),
+             (total_charge - total_spin + 1) / (2 * num_groups))
+        )
+        monopoles = spin_charge_density[:, :, 0]
+        group_charge = scatter_sum(
+            src=safe_double(monopoles), index=groups, dim=0, dim_size=num_groups
+        ).to(monopoles.dtype)
+        correction = ((group_charge - target) / group_size)[groups]
+        constrained = spin_charge_density.clone()
+        constrained[:, :, 0] = monopoles - correction
+        return constrained
+
     def _cap_charge_dipole(self, spin_charge_density: torch.Tensor) -> torch.Tensor:
         """Smoothly cap each atom's l=1 charge dipole at `dipole_cap = [onset, ceiling]`.
 
@@ -1079,6 +1171,10 @@ class PolarMACE(ScaleShiftMACE):
         """
         validate_pbc_handling(pbc_handling)
         self.electric_potential_descriptor.set_pbc_handling(pbc_handling)
+        spin_descriptor = getattr(self, "spin_potential_descriptor", None)
+        if spin_descriptor is not None:
+            spin_descriptor.set_pbc_handling(pbc_handling)
+            spin_descriptor.static_quantities = None
         self.coulomb_energy.set_pbc_handling(pbc_handling)
         self.pbc_handling = pbc_handling
         self.electric_potential_descriptor.static_quantities = None
@@ -1093,9 +1189,44 @@ class PolarMACE(ScaleShiftMACE):
         """
         validate_realspace_method(realspace_method)
         self.electric_potential_descriptor.set_realspace_method(realspace_method)
+        spin_descriptor = getattr(self, "spin_potential_descriptor", None)
+        if spin_descriptor is not None:
+            spin_descriptor.set_realspace_method(realspace_method)
         self.coulomb_energy.set_realspace_method(realspace_method)
         self.realspace_method = realspace_method
         self.electric_potential_descriptor.static_quantities = None
+
+    def _compute_potential_features(
+        self, spin_charge_density, field_cache, spin_cache, half_external_field
+    ):
+        """Build either spin-resolved Coulomb or Coulomb-charge/screened-spin fields."""
+        alpha = spin_charge_density[:, 0, :].clone()
+        beta = spin_charge_density[:, 1, :].clone()
+        to_mul_ir = getattr(self, "_charges_to_mul_ir", None)
+        if to_mul_ir is not None:
+            alpha, beta = to_mul_ir(alpha), to_mul_ir(beta)
+        if getattr(self, "potential_feature_mode", "alpha_beta") == "charge_spin":
+            first = 0.5 * self.electric_potential_descriptor.forward_dynamic(
+                cache=field_cache, source_feats=alpha + beta
+            )
+            second = 0.5 * self.spin_potential_descriptor.forward_dynamic(
+                cache=spin_cache, source_feats=alpha - beta
+            )
+        else:
+            first = self.electric_potential_descriptor.forward_dynamic(
+                cache=field_cache, source_feats=alpha
+            )
+            second = self.electric_potential_descriptor.forward_dynamic(
+                cache=field_cache, source_feats=beta
+            )
+        from_mul_ir = getattr(self, "_field_from_mul_ir", None)
+        if from_mul_ir is not None:
+            first, second = from_mul_ir(first), from_mul_ir(second)
+        first = (first + half_external_field) / self.field_feature_norms
+        if getattr(self, "potential_feature_mode", "alpha_beta") == "alpha_beta":
+            second = second + half_external_field
+        second = second / self.field_feature_norms
+        return torch.cat((first, second), dim=-1)
 
     def forward(
         self,
@@ -1111,6 +1242,12 @@ class PolarMACE(ScaleShiftMACE):
         lammps_mliap: bool = False,
         fermi_level: Optional[torch.Tensor] = None,
         external_field: Optional[torch.Tensor] = None,
+        MM_coordinate: Optional[torch.Tensor] = None,
+        MM_charges: Optional[torch.Tensor] = None,
+        MM_batch: Optional[torch.Tensor] = None,
+        MM_method: str = "direct",
+        MM_charge_width: float = 0.0,
+        compute_polar2_response: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         if not GRAPH_LONGRANGE_AVAILABLE:
             raise ImportError(
@@ -1148,6 +1285,32 @@ class PolarMACE(ScaleShiftMACE):
         long_range_cell = cell.view(-1, 3, 3)
         long_range_rcell = data["rcell"].view(-1, 3, 3)
         long_range_volume = data["volume"]
+        if MM_coordinate is None:
+            MM_coordinate = data.get("MM_coordinate")
+        if MM_charges is None:
+            MM_charges = data.get("MM_charges")
+        if MM_batch is None:
+            MM_batch = data.get("MM_batch")
+        if MM_coordinate is not None and MM_coordinate.numel() == 0:
+            MM_coordinate, MM_charges, MM_batch = None, None, None
+        if (MM_coordinate is None) != (MM_charges is None):
+            raise ValueError("MM_coordinate and MM_charges must be supplied together.")
+        if MM_coordinate is not None:
+            if compute_virials or compute_stress or compute_displacement or compute_hessian or compute_edge_forces or compute_atomic_stresses:
+                raise NotImplementedError("MM embedding currently supports energies and Cartesian forces.")
+            MM_coordinate = MM_coordinate.to(positions)
+            MM_charges = MM_charges.to(positions).reshape(-1)
+            if MM_coordinate.shape != (len(MM_charges), 3):
+                raise ValueError("MM_coordinate must have shape [n_MM, 3].")
+            if MM_batch is None:
+                if num_graphs != 1:
+                    raise ValueError("MM_batch is required for batched MM coordinates.")
+                MM_batch = torch.zeros(len(MM_charges), device=positions.device, dtype=torch.long)
+            MM_batch = MM_batch.to(device=positions.device, dtype=torch.long)
+            if MM_batch.shape != MM_charges.shape or torch.any(MM_batch < 0) or torch.any(MM_batch >= num_graphs):
+                raise ValueError("MM_batch must identify each MM charge's graph.")
+            if compute_force:
+                MM_coordinate = MM_coordinate.requires_grad_(True)
         if compute_virials or compute_stress or compute_displacement:
             assert displacement is not None
             strain = 0.5 * (displacement + displacement.transpose(-1, -2))
@@ -1165,6 +1328,8 @@ class PolarMACE(ScaleShiftMACE):
             self, "compute_dipole_from_electric_field", False
         )
         compute_polarizability = getattr(self, "compute_polarizability", False)
+        if compute_polar2_response:
+            compute_dipole_from_electric_field = True
         if compute_polarizability or compute_dipole_from_electric_field:
             external_field = external_field.detach().requires_grad_(True)
         external_potential = torch.hstack(
@@ -1269,6 +1434,19 @@ class PolarMACE(ScaleShiftMACE):
             pbc=data["pbc"].view(-1, 3),
         )
         self.electric_potential_descriptor.static_quantities = None
+        spin_field_cache = None
+        if getattr(self, "spin_potential_descriptor", None) is not None:
+            spin_field_cache = self.spin_potential_descriptor.precompute_geometry(
+                k_vectors=k_vectors,
+                k_norm2=kv_norms_squared,
+                k_vector_batch=k_vectors_batch,
+                k0_mask=k_vectors_0mask,
+                node_positions=long_range_positions,
+                batch=data["batch"],
+                volume=long_range_volume,
+                pbc=data["pbc"].view(-1, 3),
+            )
+            self.spin_potential_descriptor.static_quantities = None
 
         # SCF fixed point
         features_mixed = self.layer_feature_mixer(torch.stack(node_feats_list, dim=0))
@@ -1284,21 +1462,23 @@ class PolarMACE(ScaleShiftMACE):
         )
         Q_p_S = (data["total_charge"] + (data["total_spin"] - 1))[data["batch"]]
         Q_m_S = (data["total_charge"] - (data["total_spin"] - 1))[data["batch"]]
-        pred_total_charges_0 = scatter_sum(
-            src=safe_double(spin_charge_density[:, :, 0]),
-            index=data["batch"],
-            dim=0,
-            dim_size=num_graphs,
-        )[data["batch"]].to(vectors.dtype)
-        spin_charge_density = spin_charge_density.clone()
-        spin_charge_density[:, 0, 0] = spin_charge_density[:, 0, 0] + fukui_sources[
-            :, 0
-        ] * ((Q_p_S / 2) - pred_total_charges_0[:, 0])
-        spin_charge_density[:, 1, 0] = spin_charge_density[:, 1, 0] + fukui_sources[
-            :, 1
-        ] * ((Q_m_S / 2) - pred_total_charges_0[:, 1])
+        if "constraint_group" not in data:
+            pred_total_charges_0 = scatter_sum(
+                src=safe_double(spin_charge_density[:, :, 0]),
+                index=data["batch"],
+                dim=0,
+                dim_size=num_graphs,
+            )[data["batch"]].to(vectors.dtype)
+            spin_charge_density = spin_charge_density.clone()
+            spin_charge_density[:, 0, 0] = spin_charge_density[:, 0, 0] + fukui_sources[
+                :, 0
+            ] * ((Q_p_S / 2) - pred_total_charges_0[:, 0])
+            spin_charge_density[:, 1, 0] = spin_charge_density[:, 1, 0] + fukui_sources[
+                :, 1
+            ] * ((Q_m_S / 2) - pred_total_charges_0[:, 1])
         if getattr(self, "dipole_cap", None) is not None:
             spin_charge_density = self._cap_charge_dipole(spin_charge_density)
+        spin_charge_density = self._constrain_charge_groups(spin_charge_density, data)
 
         potential_features = torch.zeros(
             (data["batch"].size(-1), self.potential_irreps.dim),
@@ -1309,54 +1489,41 @@ class PolarMACE(ScaleShiftMACE):
         esps: Optional[torch.Tensor] = None
 
         final_fukui_sources = fukui_sources
+        # Both the geometry and the electric field are constant through the loop.
+        barycenter = scatter_mean(
+            src=safe_double(long_range_positions),
+            index=data["batch"],
+            dim=0,
+            dim_size=num_graphs,
+        ).to(positions.dtype)
+        half_external_field = 0.5 * self.external_field_contribution(
+            data["batch"],
+            long_range_positions - barycenter[data["batch"], :],
+            external_potential,
+        )
+        MM_density_potential = None
+        if MM_coordinate is not None:
+            from .mm_embedding import MM_potential_features
+
+            MM_external_field, MM_density_potential = MM_potential_features(
+                self, long_range_positions, data["batch"], MM_coordinate,
+                MM_charges, MM_batch, long_range_cell, data["pbc"].view(-1, 3),
+                k_vectors, kv_norms_squared, k_vectors_batch, k_vectors_0mask,
+                method=MM_method, MM_charge_width=MM_charge_width,
+            )
+            from_mul_ir = getattr(self, "_field_from_mul_ir", None)
+            if from_mul_ir is not None:
+                MM_external_field = from_mul_ir(MM_external_field)
+            half_external_field = half_external_field + 0.5 * MM_external_field
+
         for i in range(self.num_recursion_steps):
-            source_feats_alpha = spin_charge_density[:, 0, :].clone()
-            source_feats_beta = spin_charge_density[:, 1, :].clone()
-            if charges_to_mul_ir is not None:
-                source_feats_alpha = charges_to_mul_ir(source_feats_alpha)
-                source_feats_beta = charges_to_mul_ir(source_feats_beta)
-            field_feats_alpha = self.electric_potential_descriptor.forward_dynamic(
-                cache=field_feature_cache,
-                source_feats=source_feats_alpha,
+            potential_features = self._compute_potential_features(
+                spin_charge_density, field_feature_cache,
+                spin_field_cache, half_external_field,
             )
-            field_feats_beta = self.electric_potential_descriptor.forward_dynamic(
-                cache=field_feature_cache,
-                source_feats=source_feats_beta,
-            )
-            field_from_mul_ir = getattr(self, "_field_from_mul_ir", None)
-            if field_from_mul_ir is not None:
-                field_feats_alpha = field_from_mul_ir(field_feats_alpha)
-                field_feats_beta = field_from_mul_ir(field_feats_beta)
-            esps = None
 
-            # Add external field contribution and subtract barycenter for gauge invariance
-            barycenter = scatter_mean(
-                src=safe_double(long_range_positions),
-                index=data["batch"],
-                dim=0,
-                dim_size=num_graphs,
-            ).to(positions.dtype)
-            half_external_field = 0.5 * self.external_field_contribution(
-                data["batch"],
-                long_range_positions - barycenter[data["batch"], :],
-                external_potential,
-            )
-            field_feats_alpha = (
-                field_feats_alpha + half_external_field
-            ) / self.field_feature_norms
-            field_feats_beta = (
-                field_feats_beta + half_external_field
-            ) / self.field_feature_norms
-
-             # Spin-Summed Field
-            if self.spin_summed_field:
-                potential_features = (field_feats_alpha + field_feats_beta) / 2
-                potential_features = torch.cat([potential_features, potential_features], dim=-1)
-            else:
-                potential_features = torch.cat(
-                    (field_feats_alpha, field_feats_beta), dim=-1
-                )         
             charge_sources_out = self.field_dependent_charges_maps[i](
+                cutoff=cutoff,
                 node_attrs=data["node_attrs"],
                 node_feats=features_mixed,
                 edge_attrs=edge_attrs[:, : self.from_ell_max_field_update],
@@ -1381,23 +1548,33 @@ class PolarMACE(ScaleShiftMACE):
                 current_fukui_sources, data["batch"], num_graphs
             )
             final_fukui_sources = current_fukui_sources
-            pred_total_charges = scatter_sum(
-                src=safe_double(spin_charge_density[:, :, 0]),
-                index=data["batch"],
-                dim=0,
-                dim_size=num_graphs,
-            )[data["batch"]].to(vectors.dtype)
-            spin_charge_density = spin_charge_density.clone()
-            spin_charge_density[:, 0, 0] = spin_charge_density[
-                :, 0, 0
-            ] + current_fukui_sources[:, 0] * ((Q_p_S / 2) - pred_total_charges[:, 0])
-            spin_charge_density[:, 1, 0] = spin_charge_density[
-                :, 1, 0
-            ] + current_fukui_sources[:, 1] * ((Q_m_S / 2) - pred_total_charges[:, 1])
+            if "constraint_group" not in data:
+                pred_total_charges = scatter_sum(
+                    src=safe_double(spin_charge_density[:, :, 0]),
+                    index=data["batch"],
+                    dim=0,
+                    dim_size=num_graphs,
+                )[data["batch"]].to(vectors.dtype)
+                spin_charge_density = spin_charge_density.clone()
+                spin_charge_density[:, 0, 0] = spin_charge_density[
+                    :, 0, 0
+                ] + current_fukui_sources[:, 0] * ((Q_p_S / 2) - pred_total_charges[:, 0])
+                spin_charge_density[:, 1, 0] = spin_charge_density[
+                    :, 1, 0
+                ] + current_fukui_sources[:, 1] * ((Q_m_S / 2) - pred_total_charges[:, 1])
             if getattr(self, "dipole_cap", None) is not None:
                 spin_charge_density = self._cap_charge_dipole(spin_charge_density)
+            spin_charge_density = self._constrain_charge_groups(spin_charge_density, data)
 
+        # The final SCF update changes charges after the last field evaluation.
+        # Refresh the local-electron readout field using the constrained final charges.
+        if getattr(self, "recompute_field_after_scf", False):
+            potential_features = self._compute_potential_features(
+                spin_charge_density, field_feature_cache,
+                spin_field_cache, half_external_field,
+            )
         total_energy = e0 + inter_e
+
         local_q_e = self.local_electron_energy(
             node_attrs=data["node_attrs"],
             node_feats=node_feats,
@@ -1455,11 +1632,24 @@ class PolarMACE(ScaleShiftMACE):
             volume=long_range_volume,
             pbc=data["pbc"].view(-1, 3),
         )
-        total_energy = (
-            total_energy
-            + electro_energy
-            + torch.sum(external_potential[:, 1:] * total_dipole, dim=-1)
-        )
+        if getattr(self, "add_electrostatic_energy", True):
+            total_energy = (
+                total_energy
+                + electro_energy
+                + torch.sum(external_potential[:, 1:] * total_dipole, dim=-1)
+            )
+            if MM_coordinate is not None:
+                # add ML charge density interaction with MM charge density
+                assert MM_density_potential is not None
+                MM_electro_energy = scatter_sum(
+                    (charge_density_mul_ir * MM_density_potential).sum(-1),
+                    data["batch"], dim=0, dim_size=num_graphs,
+                )
+                total_energy = total_energy + MM_electro_energy
+
+        else:
+            electro_energy = torch.zeros_like(electro_energy)
+
         total_dipole_from_electric_field: Optional[torch.Tensor] = None
         total_polarizability: Optional[torch.Tensor] = None
         if compute_dipole_from_electric_field or compute_polarizability:
@@ -1504,6 +1694,17 @@ class PolarMACE(ScaleShiftMACE):
                     total_polarizability = total_polarizability.permute(1, 0, 2)
             if not compute_dipole_from_electric_field:
                 total_dipole_from_electric_field = None
+        # The internal field F is minus the physical electric field:
+        # E(F) = E(0) + mu.F - 1/2 F.alpha.F. Return physical response in
+        # e A^2/V. Use scalar VJPs for compatibility with higher derivatives.
+        polar2_alpha_field: Optional[torch.Tensor] = None
+        polar2_alpha_multipole: Optional[torch.Tensor] = None
+        if compute_polar2_response:
+            assert total_dipole_from_electric_field is not None
+            polar2_alpha_field = physical_polarizability(
+                total_dipole_from_electric_field, external_field, training)
+            polar2_alpha_multipole = physical_polarizability(
+                total_dipole, external_field, training)
         spin_dipole: Optional[torch.Tensor] = None
         spin_quadrupole: Optional[torch.Tensor] = None
         if getattr(self, "compute_spin_multipoles", False):
@@ -1522,6 +1723,14 @@ class PolarMACE(ScaleShiftMACE):
         quadrupole = compute_traceless_quadrupole_permuted(
             charge_density_mul_ir, long_range_positions, data["batch"], num_graphs
         )
+        MM_forces: Optional[torch.Tensor] = None
+        if MM_coordinate is not None and compute_force:
+            MM_gradient = torch.autograd.grad(
+                [total_energy], [MM_coordinate], [torch.ones_like(total_energy)],
+                create_graph=training, retain_graph=True, allow_unused=True,
+            )[0]
+            MM_forces = torch.zeros_like(MM_coordinate) if MM_gradient is None else -MM_gradient
+
         forces, virials, stress, hessian, edge_forces, _ = get_outputs(
             energy=total_energy,
             positions=positions,
@@ -1558,6 +1767,7 @@ class PolarMACE(ScaleShiftMACE):
             + safe_double(node_inter_es.clone()),
             "interaction_energy": inter_e,
             "forces": forces,
+            "MM_forces": MM_forces,
             "edge_forces": edge_forces,
             "virials": virials,
             "stress": stress,
@@ -1579,6 +1789,8 @@ class PolarMACE(ScaleShiftMACE):
             "total_dipole_from_electric_field": total_dipole_from_electric_field,
             "polarizability": total_polarizability,
             "total_polarizability": total_polarizability,
+            "polar2_alpha_field": polar2_alpha_field,
+            "polar2_alpha_multipole": polar2_alpha_multipole,
             "quadrupole": quadrupole,
             "spin_dipole": spin_dipole,
             "spin_quadrupole": spin_quadrupole,

@@ -203,6 +203,31 @@ def transfer_weights(
         last_layer_kmax,
     )
 
+    # Polar response layers can contain their own MACE product basis. Their
+    # symmetric contractions need the same conversion as backbone products.
+    for name, block in source_model.named_modules():
+        if type(block).__name__ != "MessagePassingMultipoleUpdate":
+            continue
+        prefix = name + ".product."
+        response_source = {
+            "products.0." + key[len(prefix) :]: value
+            for key, value in source_dict.items()
+            if key.startswith(prefix)
+        }
+        response_target = {}
+        transfer_symmetric_contractions(
+            response_source,
+            response_target,
+            1,
+            torch.nn.ModuleList([block.product]),
+            block.correlation,
+            1,
+            False,
+            True,
+        )
+        for key, value in response_target.items():
+            target_dict[prefix + key[len("products.0.") :]] = value
+
     transferred_keys = set()
     remaining_keys = (
         set(source_dict.keys()) & set(target_dict.keys()) - transferred_keys

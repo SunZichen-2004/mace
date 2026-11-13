@@ -25,6 +25,8 @@ from mace.modules.field_blocks import (
     AgnosticEmbeddedOneBodyVariableUpdate,
     MLPNonLinearity,
     OneBodyMLPFieldReadout,
+    OneBodyNoFeildTPMLPFieldReadout,
+    OneBodyTPMLPFieldReadout,
     field_readout_blocks,
     field_update_blocks,
 )
@@ -35,7 +37,7 @@ from mace.tools.torch_tools import default_dtype
 ATOMIC_NUMBERS = [1, 8]
 
 
-def build(fixedpoint=None, readout=None):
+def build(fixedpoint=None, readout=None, *, extra_argv=()):
     """A small PolarMACE, built the way `configure_model` builds one."""
     argv = [
         "--name", "polarblocks",
@@ -51,6 +53,7 @@ def build(fixedpoint=None, readout=None):
         argv += ["--fixedpoint_update_config", fixedpoint]
     if readout is not None:
         argv += ["--field_readout_config", readout]
+    argv += list(extra_argv)
     args = build_default_arg_parser().parse_args(argv)
     args.std, args.mean = 1.0, 0.0
 
@@ -149,6 +152,23 @@ def test_the_flags_reach_the_model_as_dicts():
     assert model._field_readout_config == {"type": "OneBodyMLPFieldReadout"}
 
 
+@pytest.mark.parametrize("layer_norm", [False, True])
+def test_tp_readout_is_selectable_with_optional_normalization(layer_norm):
+    config = {"type": "OneBodyTPMLPFieldReadout", "layer_norm": layer_norm}
+    model = build(readout=repr(config))
+    assert isinstance(model.local_electron_energy, OneBodyTPMLPFieldReadout)
+    assert model._field_readout_config == config
+    expected = torch.nn.LayerNorm if layer_norm else torch.nn.Identity
+    assert isinstance(model.local_electron_energy.tp_norm, expected)
+
+
+def test_no_field_tp_readout_is_selectable_from_cli_config():
+    config = {"type": "OneBodyNoFeildTPMLPFieldReadout"}
+    model = build(readout=repr(config))
+    assert isinstance(model.local_electron_energy, OneBodyNoFeildTPMLPFieldReadout)
+    assert model._field_readout_config == config
+
+
 def test_a_class_valued_key_chooses_the_block_it_names():
     """`potential_embedding_cls` is a class rather than a scalar, and the flag can
     only carry its name, so it is mapped to an implementation on the way in. The
@@ -204,3 +224,59 @@ def test_an_unknown_key_is_discarded_without_a_word():
 
     assert model._field_readout_config == {"no_such_option": 1}
     assert isinstance(model.local_electron_energy, OneBodyMLPFieldReadout)
+
+
+def test_tp_mix_can_be_omitted_and_survives_model_reconstruction():
+    from mace.tools.scripts_utils import extract_config_mace_model
+
+    model = build(fixedpoint="{'use_tp_mix': False}")
+    assert not any('tp_mix' in name for name, _ in model.named_parameters())
+    assert all(not hasattr(block, 'tp_mix') for block in model.field_dependent_charges_maps)
+    config = extract_config_mace_model(model)
+    with default_dtype(torch.float64):
+        restored = modules.PolarMACE(**config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    assert not any('tp_mix' in name for name in restored.state_dict())
+    # The disabled branch agrees with the old update (zero additive mixing),
+    # while omitting both its parameters and all of its forward computation.
+    enabled = build(fixedpoint="{'use_tp_mix': True}")
+    enabled.load_state_dict(model.state_dict(), strict=False)
+    with torch.no_grad():
+        for block in enabled.field_dependent_charges_maps:
+            block.tp_mix.weight.zero_()
+    a = model.field_dependent_charges_maps[0]
+    b = enabled.field_dependent_charges_maps[0]
+    attrs = torch.eye(2, dtype=torch.float64)
+    h = torch.randn(2, a.node_feats_irreps.dim, dtype=torch.float64, requires_grad=True)
+    v = torch.randn(2, a.potential_irreps.dim, dtype=torch.float64)
+    q = torch.randn(2, a.charges_irreps.dim, dtype=torch.float64)
+    empty = torch.empty(0, dtype=torch.float64)
+    inputs = (attrs, h, empty, empty, empty.long(), v, q)
+    y = a(*inputs)
+    torch.testing.assert_close(y, b(*inputs))
+    y.square().sum().backward()
+    assert torch.isfinite(h.grad).all()
+
+
+def test_pairwise_h_field_tp_update_builds_and_reconstructs():
+    from mace.modules.field_blocks import PairwiseGatedMultipoleUpdate
+    from mace.tools.scripts_utils import extract_config_mace_model
+
+    model = build(fixedpoint="{'type': 'PairwiseGatedMultipoleUpdate', 'step_scale': 0.5}")
+    block = model.field_dependent_charges_maps[0]
+    assert isinstance(block, PairwiseGatedMultipoleUpdate)
+    assert block.step_scale == 0.5
+    assert block.gate_mlp.hs == [8, 64, 64, 64, 24]
+    config = extract_config_mace_model(model)
+    with default_dtype(torch.float64):
+        restored = modules.PolarMACE(**config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    restored_block = restored.field_dependent_charges_maps[0]
+    assert isinstance(restored_block, PairwiseGatedMultipoleUpdate)
+    attrs = torch.eye(2, dtype=torch.float64)
+    h = torch.randn(2, 16, dtype=torch.float64)
+    v = torch.randn(2, block.potential_irreps.dim, dtype=torch.float64)
+    p = torch.randn(2, block.charges_irreps.dim, dtype=torch.float64)
+    empty = torch.empty(0, dtype=torch.float64)
+    inputs = (attrs, h, empty, empty, empty.long(), v, p)
+    torch.testing.assert_close(block(*inputs), restored_block(*inputs))

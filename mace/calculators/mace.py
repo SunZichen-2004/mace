@@ -105,6 +105,15 @@ class MACECalculator(Calculator):
             True). Set False for fixed-cell MD; stress is then unavailable through
             ASE and cannot be combined with compute_atomic_stresses=True.
 
+        charge_constraint_groups: optional disjoint lists of zero-based atom
+            indices (PolarMACE only). Uniform monopole projection is applied
+            before field evaluation and after each recursion, replacing global
+            Fukui-weighted normalisation. Unlisted atoms form a remainder group.
+        group_charges: target net charge in e for each explicit group.
+        group_spins: optional target spin polarisation (alpha minus beta) for
+            each group, NOT multiplicity. None constrains only global spin.
+            Use set_charge_constraints() to change groups and clear ASE caches.
+
     Dipoles are returned in units of Debye
     """
 
@@ -134,6 +143,9 @@ class MACECalculator(Calculator):
         pbc_handling: str = "auto",
         realspace_method: Union[str, None] = None,
         compute_stress: bool = True,
+        charge_constraint_groups=None,
+        group_charges=None,
+        group_spins=None,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
@@ -209,6 +221,9 @@ class MACECalculator(Calculator):
         self.arrays_keys = arrays_keys
 
         self.model_type = model_type
+        self.set_charge_constraints(
+            charge_constraint_groups, group_charges, group_spins
+        )
         self.compute_atomic_stresses = False
 
         if model_type not in [
@@ -708,6 +723,105 @@ class MACECalculator(Calculator):
         self.realspace_method = realspace_method
         self.reset()
 
+    def set_charge_constraints(self, groups=None, charges=None, spins=None) -> None:
+        """Set disjoint atom-index groups and targets; None disables constraints.
+
+        Charges are required when groups are supplied. Spins are optional signed
+        alpha-minus-beta targets. Unlisted atoms absorb the remaining global
+        charge/spin; a complete partition must match atoms.info charge/spin.
+        """
+        if groups is None:
+            if charges is not None or spins is not None:
+                raise ValueError("group targets require charge_constraint_groups")
+            self.charge_constraint_groups = None
+            self.group_charges = None
+            self.group_spins = None
+        else:
+            if self.model_type != "PolarMACE":
+                raise ValueError("charge constraints require model_type='PolarMACE'")
+            copied = []
+            seen = set()
+            for group in groups:
+                indices = tuple(group)
+                if not indices or any(
+                    isinstance(i, (bool, np.bool_))
+                    or not isinstance(i, (int, np.integer))
+                    or i < 0
+                    for i in indices
+                ):
+                    raise ValueError(
+                        "each group needs non-negative integer atom indices"
+                    )
+                if len(set(indices)) != len(indices) or seen.intersection(indices):
+                    raise ValueError("charge constraint groups must not overlap")
+                seen.update(indices)
+                copied.append(indices)
+            if not copied:
+                raise ValueError("charge_constraint_groups must not be empty")
+            targets = np.asarray(charges, dtype=float)
+            if targets.shape != (len(copied),) or not np.isfinite(targets).all():
+                raise ValueError("group_charges needs one finite target per group")
+            spin_targets = None if spins is None else np.asarray(spins, dtype=float)
+            if spin_targets is not None and (
+                spin_targets.shape != targets.shape
+                or not np.isfinite(spin_targets).all()
+            ):
+                raise ValueError("group_spins needs one finite target per group")
+            self.charge_constraint_groups = tuple(copied)
+            self.group_charges = tuple(targets.tolist())
+            self.group_spins = (
+                None if spin_targets is None else tuple(spin_targets.tolist())
+            )
+        self.reset()
+
+    def _add_charge_constraints(self, batch_dict: dict, num_real_atoms: int) -> None:
+        """Attach validated group tensors to a single ASE structure's batch."""
+        if self.charge_constraint_groups is None:
+            return
+        if any(
+            getattr(model, "charge_constraint_group_size", None) is not None
+            for model in self.models
+        ):
+            raise ValueError("explicit groups cannot be combined with group_size")
+        groups = self.charge_constraint_groups
+        if max(max(group) for group in groups) >= num_real_atoms:
+            raise ValueError("charge constraint atom index is out of range")
+        ids = np.full(num_real_atoms, len(groups), dtype=np.int64)
+        for g, indices in enumerate(groups):
+            ids[list(indices)] = g
+        charges = list(self.group_charges)
+        spins = None if self.group_spins is None else list(self.group_spins)
+        total_charge = float(batch_dict["total_charge"][0])
+        total_spin = float(batch_dict["total_spin"][0]) - 1
+        if np.any(ids == len(groups)):
+            charges.append(total_charge - sum(charges))
+            if spins is not None:
+                spins.append(total_spin - sum(spins))
+        else:
+            if not np.isclose(sum(charges), total_charge, rtol=0, atol=1e-6):
+                raise ValueError("group_charges must sum to the system total charge")
+            if spins is not None and not np.isclose(
+                sum(spins), total_spin, rtol=0, atol=1e-6
+            ):
+                raise ValueError("group_spins must sum to total_spin - 1")
+        num_padding = batch_dict["positions"].shape[0] - num_real_atoms
+        if num_padding:
+            ids = np.concatenate((ids, np.full(num_padding, len(charges))))
+            charges.append(0.0)
+            if spins is not None:
+                spins.append(0.0)
+        device = batch_dict["positions"].device
+        batch_dict["constraint_group"] = torch.as_tensor(
+            ids, dtype=torch.long, device=device
+        )
+        batch_dict["constraint_group_charges"] = torch.tensor(
+            charges, dtype=torch.float64, device=device
+        )
+        if spins is not None:
+            batch_dict["constraint_group_spins"] = torch.tensor(
+                spins, dtype=torch.float64, device=device
+            )
+
     def _validate_electrostatic_pbcs(self, atoms) -> None:
         """Check compatibility of geometry and pbc_handling. For pbc_handling in
         [realspace, slab, molecule_in_box], checks that atoms.pbc is as exepected."""
@@ -769,6 +883,7 @@ class MACECalculator(Calculator):
                 if torch.is_tensor(value) and torch.is_floating_point(value):
                     batch[key] = value.to(dtype=model_dtype)
             batch_dict = batch.to_dict()
+            self._add_charge_constraints(batch_dict, num_real_atoms)
 
             if oeq_compile and compute_stress:
                 positions = batch_dict["positions"]
