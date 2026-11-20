@@ -677,3 +677,12 @@ sample is retained. Pair counts include QM/MM pairs and within-QM pairs.
 
 Records whose MM-gradient shape does not match the MM coordinates are warned
 about and skipped explicitly; no missing MM force labels are fabricated.
+
+### Latest MACE-POLAR-2 training checkpoint
+
+The [657,881,785-configuration research snapshot](examples/polar2/checkpoints/657881785/README.md)
+provides the matching code, required graph-electrostatics dependency, original
+training configuration and checksums. The large training checkpoint and
+schedule-free inference model are [Release assets](https://github.com/SunZichen-2004/mace/releases/tag/mace-polar-2-657881785).
+See the snapshot notes for validation coverage and the known validation-loss
+definition mismatch. This is a personal-fork snapshot, not an official upstream release.

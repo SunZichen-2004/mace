@@ -1,0 +1,94 @@
+{
+  "seen_configs": 657881785,
+  "optimizer_step": null,
+  "inference_weights": "schedulefree_eval_x; optimizer.eval applied exactly once",
+  "checkpoint_sha256": "2f886e11eddf27a4e4833f30b75ffe57f13db2de280623cb3542bee9b5eabf99",
+  "model_sha256": "02be740184b13f492e6324752d387a52b0edb37fc9de34fce9be638a2a499ff8",
+  "heads": [
+    "omol",
+    "bms25"
+  ],
+  "potential_feature_mode": "charge_spin",
+  "fixedpoint_update_config": {
+    "type": "PairwiseGatedMultipoleUpdate"
+  },
+  "field_feature_widths": [
+    0.5,
+    0.8,
+    1.2,
+    1.5,
+    3.0
+  ],
+  "dipole_cap": [
+    2.0,
+    4.0
+  ],
+  "parameters": 16648867,
+  "release_tag": "mace-polar-2-657881785",
+  "base_branch": "mace-polar-2",
+  "code_source": "Frozen code from the training run that produced this checkpoint",
+  "validation_note": "Latest training checkpoint; full validation last completed at epoch 5 (623119033 configs); latest fixed-4096 validation at 655000249 configs. Neither is a direct validation of 657881785.",
+  "known_issue": "Historical streaming validation uses force component MSE, while training uses mean per-atom force-error vector L2 norm. RMSE/MAE definitions are separate and unchanged.",
+  "assets": [
+    {
+      "name": "polar2_657881785_training.pt",
+      "bytes": 333515313,
+      "sha256": "2f886e11eddf27a4e4833f30b75ffe57f13db2de280623cb3542bee9b5eabf99",
+      "url": "https://github.com/SunZichen-2004/mace/releases/download/mace-polar-2-657881785/polar2_657881785_training.pt"
+    },
+    {
+      "name": "polar2_657881785_schedulefree_eval.model",
+      "bytes": 67536675,
+      "sha256": "02be740184b13f492e6324752d387a52b0edb37fc9de34fce9be638a2a499ff8",
+      "url": "https://github.com/SunZichen-2004/mace/releases/download/mace-polar-2-657881785/polar2_657881785_schedulefree_eval.model"
+    }
+  ],
+  "source_sha256": {
+    "mace/data/polar2_dataset.py": "e6dd9f903072fd42f84f07fcd781e1adf1ef7498411ff9f84343f808cb33d2cb",
+    "mace/data/polar2_epoch.py": "64bcb182b264b4d768d1e231a4a759d005cb902b7e64b9f4a27a0519ac1e00eb",
+    "mace/modules/polar2_loss.py": "0a6bc9cfb53a7877008fbe7d588c84d670f1f88d1c0f4babb157583e4ec37ac1",
+    "mace/tools/polar2_accumulation.py": "84efcbfe6a42cc4308074f44a94f9d51e16dc57ff1d35a7c2b62b7d7564cf1c6",
+    "mace/tools/polar2_metrics.py": "18e08bcde40efc3dfd2518889734f42a19fab5f8d3eca63116fab4ba1e4c2123",
+    "mace/tools/train.py": "aabeb16f6f132d65b421b0d263402745c5d44eeb9fbff45572933f2f54d00cc1",
+    "examples/polar2/checkpoints/657881785/train_with_walltime.py": "79961639aea32ee15ca2dbac1ab9a0f30d9a537e750833fd1ac56a1d263fd326"
+  },
+  "graph_electrostatics": {
+    "origin": "https://github.com/steffen-wedig/graph_electrostatics.git",
+    "local_base_commit": "c11eedcd751066781d178b11688ff0abb77f138d",
+    "local_changes": [
+      "graph_longrange/__init__.py",
+      "graph_longrange/gaussian_multipoles.py",
+      "docs/gaussian_weighted_multipoles.md",
+      "tests/test_gaussian_multipoles.py"
+    ],
+    "vendored_path": "external/graph_electrostatics",
+    "note": "Working-tree dependency used by the original run; upstream graph-longrange 0.4.4 alone cannot load this model.",
+    "source_sha256": {
+      "graph_longrange/__init__.py": "46db8cc9cff7cb88b22f7a5246665128eb279515ea0bbdc9f5e1641696c9eafa",
+      "graph_longrange/__version__.py": "c70fdd622a5b6869ba695d8e3e01f6df8fce0d19cc3610d660b6aed471546804",
+      "graph_longrange/energy.py": "0d03e214036d468d7f4d99e544db7be20e084769c42e18f5af42fdcb00928f31",
+      "graph_longrange/external_source_energy.py": "e7cef43c35ecae00e663b4157295ef416a31fd174d5707543ddb7dd8d191b019",
+      "graph_longrange/external_source_features.py": "9f96868ab17c7f32c3d45afab078a44fc0e4d6804e1cad40bd37cc65ff3b2e49",
+      "graph_longrange/external_source_realspace.py": "79b85e4b1d96cedf944b42270419532572e855b092a72e78c11c56e482cfd18a",
+      "graph_longrange/features.py": "0ed08d90b3dbd4a7e8968c21e0a9d8e514304ed82e6c89870fb2999581cf9178",
+      "graph_longrange/gaussian_multipoles.py": "c5181d22d124aea3ed5767711ee174ce0e568d2b5830d655d980c022dd5afadd",
+      "graph_longrange/gto_utils.py": "9f84ee541d45160eded094628d9a27e3d4a050501d5652da4e482c190010628f",
+      "graph_longrange/jellium_energy.py": "11845f9cdef7769e2992b16f0534f9b0bb288114be4a7c980075e27d89bfc458",
+      "graph_longrange/jellium_features.py": "e98ec3cf6cbad39b481961161d383c269fc93c334aea15eeb3ceb6aa9db17e35",
+      "graph_longrange/kspace.py": "8e37e89031a7860f695fe58640db6d0eecc65c12ab4414c1bdaa10d669c188c3",
+      "graph_longrange/realspace_electrostatics.py": "19d147605d2ea5f68d14ea45edeeb89020ed2228e0af870fd1cf2c2ae4b17281",
+      "graph_longrange/realspace_grid_integrals.py": "784e0d2f209c4fd445c4f40c9222635014030e9df494ad0306ed1eaf847be3b7",
+      "graph_longrange/slabs.py": "70514a08c1aecdd342dd539f20eb253d310f1a924e47c8ea337cff567d6264ff",
+      "graph_longrange/utils.py": "1f8a9b63140b6131ec89f5f9ae9674dccb66d405fb6d326389142149390f4c34"
+    }
+  },
+  "base_commit": "0d19c1d835352942bf3b158ac5084640a59e93c4",
+  "verification": {
+    "mace_tests_passed": 18,
+    "graph_tests_passed": 13,
+    "cpu_load_and_state_keys": true,
+    "all_model_parameters_finite": true,
+    "gpu_inference_rerun": false,
+    "full_validation_rerun": false
+  }
+}

@@ -28,6 +28,11 @@ class Polar2Metrics:
         self.num_data += batch.num_graphs
         n = (batch.ptr[1:] - batch.ptr[:-1]).double()
         for row, (name, branch, _, absolute) in enumerate(SPECS):
+            # The source can carry labels for tasks disabled in this E/F run.
+            # Match POLAR2Loss.weighted_components: absent zero-weight branches
+            # neither require predictions nor contribute validation metrics.
+            if float(getattr(self.loss_fn, name + '_weight')) == 0.0:
+                continue
             target = getattr(batch, name)
             if name in ('quadrupole', 'spin_quadrupole'):
                 target = target.reshape(-1, 3, 3)

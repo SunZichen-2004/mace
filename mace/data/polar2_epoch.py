@@ -42,7 +42,7 @@ def epoch_plan(sampler):
         weights.update(json.loads(Path(control).read_text())['weights'])
     if any(not math.isfinite(w) or w < 0 for w in weights.values()):
         raise ValueError('Invalid full-epoch sampling weights')
-    native = [(d, off) for d, off in leaves if d.sample_probability > 0]
+    native = [(d, off) for d, off in leaves if d.sample_probability > 0 and weights[d.name] > 0]
     base_size = sum(len(d) for d, _ in native)
     ratios = [weights[d.name] / (len(d) / base_size) for d, _ in native]
     scale = min(ratios)
@@ -51,7 +51,7 @@ def epoch_plan(sampler):
     plan = []
     for d, offset in leaves:
         target = int(math.ceil(base_size * weights[d.name] / scale - 1e-6))
-        if d.sample_probability > 0:
+        if d.sample_probability > 0 and weights[d.name] > 0:
             target = max(len(d), target)
         if target and len(d) < sampler.world_size:
             raise ValueError('Training source must contain at least world_size records')
@@ -69,7 +69,8 @@ def full_epoch_batches(sampler):
     plan = epoch_plan(sampler)
     order = np.repeat(np.arange(len(plan)), [p['steps'] for p in plan])
     np.random.default_rng(sampler.seed + sampler.epoch).shuffle(order)
-    cursors = [0] * len(plan)
+    # A migrated partial epoch retains each source's consumed permutation prefix.
+    cursors = [p.get('start', 0) for p in plan]
     for source in order:
         p = plan[source]
         remaining = p['target'] - cursors[source]
@@ -86,4 +87,6 @@ def full_epoch_batches(sampler):
             seed = np.random.SeedSequence([sampler.seed, sampler.epoch, int(source), int(cycle)])
             ids[sel] = permute_indices(positions[sel] % p['size'], p['size'], seed)
         cursors[source] += count
+        if p['name'] in os.environ.get('POLAR2_DISABLED_SOURCES', '').split(','):
+            continue
         yield (ids + p['offset']).tolist()
