@@ -88,7 +88,7 @@ class UnifiedDataset:
         self.spec = self.catalog["datasets"][name]
         cache_root = os.environ.get("POLAR2_NODE_CACHE")
         self.node_cache = None
-        if cache_root and name in ("spice_alpha", "bms25"):
+        if cache_root and name in os.environ.get("POLAR2_CACHE_SOURCES", "spice_alpha,bms25").split(","):
             manifest = json.loads((Path(cache_root) / "manifest.json").read_text())
             if not manifest.get("complete"):
                 raise ValueError("POLAR-2 node cache has not completed verification")
@@ -541,7 +541,7 @@ class Polar2BatchSampler:
         if not self.validation:
             if self.steps == -1:
                 from mace.data.polar2_epoch import epoch_plan
-                return sum(x["steps"] for x in epoch_plan(self))
+                return sum(x["steps"] for x in epoch_plan(self) if x["name"] not in os.environ.get("POLAR2_DISABLED_SOURCES", "").split(","))
             return self.steps
         return sum(
             max(0, (len(d) - self.rank + self.world_size - 1) // self.world_size + d.batch_size - 1) // d.batch_size

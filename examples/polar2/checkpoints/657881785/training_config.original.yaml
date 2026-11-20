@@ -1,0 +1,78 @@
+name: MACE_POLAR2_FULL
+model: PolarMACE
+foundation_model: /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261107/polar2_pilot/initial.model
+multiheads_finetuning: false
+foundation_model_readout: true
+foundation_model_elements: true
+heads:
+  omol:
+    train_file:
+    - /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261110/polar2_EF_omol_opoly_854173/descriptors/omol140m_train.polar2
+    - /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261110/polar2_EF_omol_opoly_854173/descriptors/opoly26_train.polar2
+    valid_file:
+    - /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261110/polar2_EF_omol_opoly_854173/descriptors/omol140m_valid_batch48.polar2
+    - /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261110/polar2_EF_omol_opoly_854173/descriptors/opoly26_valid_batch32.polar2
+    E0s: /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261107/polar2_pilot/E0_omol.json
+  bms25:
+    train_file:
+    - /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261110/polar2_EF_omol_opoly_854173/descriptors/bms25_train.polar2
+    valid_file:
+    - /dais/fs/scratch/sunzc/MACE-POLAR-2/training_data_v2/full_epoch_830495_descriptors/bms25_valid.polar2
+    E0s: /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261107/polar2_pilot/E0_bms25.json
+atomic_numbers: '[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+  20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+  40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+  60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+  80, 81, 82, 83]'
+loss: polar2
+energy_weight: 10.0
+forces_weight: 10.0
+MM_forces_weight: 0.0
+dipole_weight: 0.0
+quadrupole_weight: 0.0
+spin_dipole_weight: 0.0
+spin_quadrupole_weight: 0.0
+polarizability_weight: 0.0
+potential_feature_mode: charge_spin
+spin_field_alpha: 0.5
+realspace_method: analytical
+compute_dipole_from_electric_field: false
+compute_spin_multipoles: false
+compute_polarizability_from_electric_field: false
+fukui_regularisation: 0.1
+dipole_cap: '[2.0, 4.0]'
+polar_use_eqx: false
+enable_cueq: true
+cueq_conv_fusion: false
+optimizer: schedulefree
+beta1_schedulefree: 0.9
+beta2_schedulefree: 0.98
+warmup_steps_schedulefree: 2000
+weight_decay: 1.0e-08
+lr: 0.01
+compute_avg_num_neighbors: false
+avg_num_neighbors: 30.0
+mean: 0.0
+std: 1.0
+scaling: no_scaling
+default_dtype: float32
+device: cuda
+distributed: true
+launcher: slurm
+batch_size: 128
+valid_batch_size: 16
+num_workers: 2
+polar2_steps_per_epoch: -1
+max_num_epochs: 2048
+seed: 1
+work_dir: /dais/u/sunzc/work/Develop_MACE_POLAR_2/20261110/polar2_EF_omol_opoly_854173/run
+save_cpu: true
+restart_latest: true
+ema: true
+ema_decay: 0.99999
+clip_grad: 1.0
+eval_interval: 1
+error_table: PerAtomRMSE
+patience: 2048
+save_all_checkpoints: true
+skip_evaluate_heads: bms25

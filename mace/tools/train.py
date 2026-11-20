@@ -578,7 +578,8 @@ def take_step(
     batch_dict = batch.to_dict()
 
     captured = {}
-    polar2_timing = getattr(loss_fn, "is_polar2", False) and device.type == "cuda"
+    accumulation = getattr(loss_fn, "is_polar2", False) and int(__import__("os").environ.get("POLAR2_MICROBATCH_SIZE", "0")) > 0
+    polar2_timing = getattr(loss_fn, "is_polar2", False) and device.type == "cuda" and not accumulation
     timing_events = {}
     def mark_phase(name):
         if polar2_timing:
@@ -625,7 +626,11 @@ def take_step(
         return loss
 
     try:
-        loss = closure()
+        if accumulation:
+            from .polar2_accumulation import accumulated_backward
+            loss = accumulated_backward(model, loss_fn, batch, optimizer, output_args, max_grad_norm, captured)
+        else:
+            loss = closure()
     except FloatingPointError as error:
         if getattr(loss_fn, "is_polar2", False):
             from .polar2_diagnostics import save_failure
@@ -644,6 +649,9 @@ def take_step(
     for key in ("backward_scale", "gradient_norm_before_clip"):
         if key in captured:
             loss_dict[key] = captured[key]
+    if accumulation:
+        loss_dict["microbatches"] = captured["microbatches"]
+        loss_dict["microbatch_size"] = captured["microbatch_size"]
     output = captured.get("output")
     if output is not None:
         num_atoms = batch.ptr[1:] - batch.ptr[:-1]
